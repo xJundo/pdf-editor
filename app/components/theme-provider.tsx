@@ -13,6 +13,15 @@ function ThemeProvider({
       defaultTheme="system"
       enableSystem
       disableTransitionOnChange
+      scriptProps={{ async: true }}
+      themes={[
+        "light",
+        "dark",
+        "light-blue",
+        "dark-blue",
+        "light-green",
+        "dark-green",
+      ]}
       {...props}
     >
       <ThemeHotkey />
@@ -35,7 +44,7 @@ function isTypingTarget(target: EventTarget | null) {
 }
 
 function ThemeHotkey() {
-  const { resolvedTheme, setTheme } = useTheme()
+  const { theme, setTheme } = useTheme()
 
   React.useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
@@ -55,7 +64,18 @@ function ThemeHotkey() {
         return
       }
 
-      setTheme(resolvedTheme === "dark" ? "light" : "dark")
+      const pairMap: Record<string, string> = {
+        light: "dark",
+        dark: "light",
+        "light-blue": "dark-blue",
+        "dark-blue": "light-blue",
+        "light-green": "dark-green",
+        "dark-green": "light-green",
+      }
+
+      const current = theme ?? ""
+      const nextTheme = pairMap[current] ?? (current.includes("dark") ? "light" : "dark")
+      setTheme(nextTheme)
     }
 
     window.addEventListener("keydown", onKeyDown)
@@ -63,7 +83,7 @@ function ThemeHotkey() {
     return () => {
       window.removeEventListener("keydown", onKeyDown)
     }
-  }, [resolvedTheme, setTheme])
+  }, [theme, setTheme])
 
   return null
 }

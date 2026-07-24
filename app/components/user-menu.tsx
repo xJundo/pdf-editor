@@ -1,7 +1,8 @@
 "use client"
 
 import { useRouter } from "next/navigation"
-import { ChevronDownIcon, LogOutIcon } from "lucide-react"
+import { useTheme } from "next-themes"
+import { ChevronDownIcon, LogOutIcon, MoonIcon, PaletteIcon, SunIcon } from "lucide-react"
 
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 import { Button } from "@/components/ui/button"
@@ -11,13 +12,19 @@ import {
   DropdownMenuGroup,
   DropdownMenuItem,
   DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
   DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { authClient } from "@/lib/auth-client"
 
 export function UserMenu({ name, email }: { name: string; email: string }) {
   const router = useRouter()
+  const { theme, setTheme } = useTheme()
 
   async function handleSignOut() {
     await authClient.signOut({
@@ -69,6 +76,47 @@ export function UserMenu({ name, email }: { name: string; email: string }) {
               </p>
             </div>
           </DropdownMenuLabel>
+        </DropdownMenuGroup>
+        <DropdownMenuSeparator />
+        <DropdownMenuGroup>
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger>
+              <PaletteIcon data-icon="inline-start" aria-hidden="true" />
+              Thème
+            </DropdownMenuSubTrigger>
+            <DropdownMenuSubContent className="w-52">
+              <DropdownMenuGroup>
+                <DropdownMenuRadioGroup value={theme} onValueChange={setTheme}>
+                  <DropdownMenuRadioItem value="light">
+                    <SunIcon data-icon="inline-start" aria-hidden="true" />
+                    Neutre (Clair)
+                  </DropdownMenuRadioItem>
+                  <DropdownMenuRadioItem value="dark">
+                    <MoonIcon data-icon="inline-start" aria-hidden="true" />
+                    Neutre (Sombre)
+                  </DropdownMenuRadioItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuRadioItem value="light-blue">
+                    <span className="size-2.5 rounded-full bg-blue-500 shrink-0" data-icon="inline-start" aria-hidden="true" />
+                    Océan (Clair)
+                  </DropdownMenuRadioItem>
+                  <DropdownMenuRadioItem value="dark-blue">
+                    <span className="size-2.5 rounded-full bg-blue-400 shrink-0" data-icon="inline-start" aria-hidden="true" />
+                    Océan (Sombre)
+                  </DropdownMenuRadioItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuRadioItem value="light-green">
+                    <span className="size-2.5 rounded-full bg-emerald-500 shrink-0" data-icon="inline-start" aria-hidden="true" />
+                    Émeraude (Clair)
+                  </DropdownMenuRadioItem>
+                  <DropdownMenuRadioItem value="dark-green">
+                    <span className="size-2.5 rounded-full bg-emerald-400 shrink-0" data-icon="inline-start" aria-hidden="true" />
+                    Émeraude (Sombre)
+                  </DropdownMenuRadioItem>
+                </DropdownMenuRadioGroup>
+              </DropdownMenuGroup>
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
         </DropdownMenuGroup>
         <DropdownMenuSeparator />
         <DropdownMenuGroup>

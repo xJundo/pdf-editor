@@ -80,7 +80,7 @@ export type ImageEdit =
 const MAX_REPLACEMENT_IMAGE_BYTES = 15 * 1024 * 1024
 const MIN_BOX_PT = 8
 
-const BASE_PAGE_WIDTH = 768 // px at zoom = 1 (matches the former max-w-3xl)
+const BASE_PAGE_WIDTH = 648 // Default 100% A4 width (fits main container with zero horizontal scroll)
 const ZOOM_MIN = 0.5
 const ZOOM_MAX = 3
 const ZOOM_STEP = 0.25
@@ -715,7 +715,7 @@ export function PdfEditor({
       ) : (
         <div className="flex items-start gap-6">
           <div className="min-w-0 flex-1 overflow-x-auto">
-            <div className="flex flex-col items-center gap-6">
+            <div className="w-max min-w-full mx-auto flex flex-col items-center gap-6 p-4">
               {structure.pages.map((page) => (
                 <PdfPageView
                   key={page.number}
