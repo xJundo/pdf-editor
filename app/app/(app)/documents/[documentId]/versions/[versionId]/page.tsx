@@ -1,0 +1,46 @@
+import { notFound } from "next/navigation"
+
+import { PdfEditor } from "@/components/editor/pdf-editor"
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
+import { getOwnedVersion } from "@/lib/documents"
+import { getPdfStructure } from "@/lib/pdf-service"
+import type { PdfStructure } from "@/lib/pdf-structure"
+import { requireSession } from "@/lib/session"
+
+export default async function EditorPage({
+  params,
+}: {
+  params: Promise<{ documentId: string; versionId: string }>
+}) {
+  const session = await requireSession()
+  const { documentId, versionId } = await params
+
+  const version = await getOwnedVersion(session.user.id, documentId, versionId)
+  if (!version) {
+    notFound()
+  }
+
+  let structure: PdfStructure
+  try {
+    structure = await getPdfStructure(version.filePath)
+  } catch (error) {
+    console.error("editor: structure extraction failed", error)
+    return (
+      <Alert variant="destructive">
+        <AlertTitle>Extraction impossible</AlertTitle>
+        <AlertDescription>
+          La structure de ce PDF n&apos;a pas pu être analysée. Réessayez plus tard.
+        </AlertDescription>
+      </Alert>
+    )
+  }
+
+  return (
+    <PdfEditor
+      fileUrl={`/api/documents/${documentId}/versions/${versionId}/file`}
+      structure={structure}
+      documentName={version.name}
+      versionNumber={version.versionNumber}
+    />
+  )
+}

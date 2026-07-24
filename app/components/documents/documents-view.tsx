@@ -1,0 +1,284 @@
+"use client"
+
+import { useState } from "react"
+import Link from "next/link"
+import { useRouter } from "next/navigation"
+import {
+  DownloadIcon,
+  FileTextIcon,
+  HistoryIcon,
+  MoreHorizontalIcon,
+  PencilIcon,
+  Trash2Icon,
+} from "lucide-react"
+
+import { UploadButton } from "@/components/documents/upload-button"
+import type { DocumentItem } from "@/components/documents/types"
+import { formatBytes, formatDate } from "@/components/documents/types"
+import {
+  AlertDialog,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog"
+import { Badge } from "@/components/ui/badge"
+import { Button } from "@/components/ui/button"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
+import {
+  Empty,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyMedia,
+  EmptyTitle,
+} from "@/components/ui/empty"
+import { Spinner } from "@/components/ui/spinner"
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table"
+import { toast } from "@/components/ui/toast"
+
+function downloadUrl(documentId: string, versionId: string) {
+  return `/api/documents/${documentId}/versions/${versionId}/download`
+}
+
+function editorUrl(documentId: string, versionId: string) {
+  return `/documents/${documentId}/versions/${versionId}`
+}
+
+export function DocumentsView({ documents }: { documents: DocumentItem[] }) {
+  const router = useRouter()
+  const [versionsFor, setVersionsFor] = useState<DocumentItem | null>(null)
+  const [deleteFor, setDeleteFor] = useState<DocumentItem | null>(null)
+  const [deleting, setDeleting] = useState(false)
+
+  async function handleDelete() {
+    if (!deleteFor) return
+    setDeleting(true)
+    try {
+      const response = await fetch(`/api/documents/${deleteFor.id}`, { method: "DELETE" })
+      if (!response.ok) {
+        toast.add({ type: "error", title: "Suppression impossible" })
+        return
+      }
+      toast.add({ type: "success", title: `« ${deleteFor.name} » supprimé` })
+      setDeleteFor(null)
+      router.refresh()
+    } finally {
+      setDeleting(false)
+    }
+  }
+
+  return (
+    <>
+      <div className="flex items-center justify-between gap-4">
+        <h1 className="text-xl font-semibold">Mes documents</h1>
+        <UploadButton />
+      </div>
+
+      {documents.length === 0 ? (
+        <Empty>
+          <EmptyHeader>
+            <EmptyMedia variant="icon">
+              <FileTextIcon aria-hidden="true" />
+            </EmptyMedia>
+            <EmptyTitle>Aucun document</EmptyTitle>
+            <EmptyDescription>
+              Importez un PDF pour commencer à l&apos;éditer.
+            </EmptyDescription>
+          </EmptyHeader>
+        </Empty>
+      ) : (
+        <div className="overflow-x-auto rounded-lg border">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Nom</TableHead>
+                <TableHead>Pages</TableHead>
+                <TableHead>Taille</TableHead>
+                <TableHead>Versions</TableHead>
+                <TableHead>Modifié le</TableHead>
+                <TableHead className="w-12" />
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {documents.map((doc) => {
+                const latest = doc.versions[0]
+                return (
+                  <TableRow key={doc.id}>
+                    <TableCell className="max-w-64 font-medium">
+                      {latest ? (
+                        <Link
+                          href={editorUrl(doc.id, latest.id)}
+                          className="block truncate hover:underline"
+                        >
+                          {doc.name}
+                        </Link>
+                      ) : (
+                        <span className="block truncate">{doc.name}</span>
+                      )}
+                    </TableCell>
+                    <TableCell>{latest?.pageCount ?? "—"}</TableCell>
+                    <TableCell>{latest ? formatBytes(latest.fileSize) : "—"}</TableCell>
+                    <TableCell>
+                      <Badge variant="secondary">{doc.versions.length}</Badge>
+                    </TableCell>
+                    <TableCell>{formatDate(doc.updatedAt)}</TableCell>
+                    <TableCell>
+                      <DropdownMenu>
+                        <DropdownMenuTrigger
+                          render={<Button variant="ghost" size="icon-sm" />}
+                        >
+                          <MoreHorizontalIcon aria-hidden="true" />
+                          <span className="sr-only">Actions pour {doc.name}</span>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                          <DropdownMenuGroup>
+                            {latest ? (
+                              <DropdownMenuItem
+                                render={<Link href={editorUrl(doc.id, latest.id)} />}
+                              >
+                                <PencilIcon aria-hidden="true" />
+                                Ouvrir dans l&apos;éditeur
+                              </DropdownMenuItem>
+                            ) : null}
+                            {latest ? (
+                              <DropdownMenuItem
+                                render={
+                                  <a href={downloadUrl(doc.id, latest.id)} download />
+                                }
+                              >
+                                <DownloadIcon aria-hidden="true" />
+                                Télécharger
+                              </DropdownMenuItem>
+                            ) : null}
+                            <DropdownMenuItem onClick={() => setVersionsFor(doc)}>
+                              <HistoryIcon aria-hidden="true" />
+                              Versions…
+                            </DropdownMenuItem>
+                          </DropdownMenuGroup>
+                          <DropdownMenuSeparator />
+                          <DropdownMenuGroup>
+                            <DropdownMenuItem
+                              variant="destructive"
+                              onClick={() => setDeleteFor(doc)}
+                            >
+                              <Trash2Icon aria-hidden="true" />
+                              Supprimer
+                            </DropdownMenuItem>
+                          </DropdownMenuGroup>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    </TableCell>
+                  </TableRow>
+                )
+              })}
+            </TableBody>
+          </Table>
+        </div>
+      )}
+
+      <Dialog
+        open={versionsFor !== null}
+        onOpenChange={(open) => !open && setVersionsFor(null)}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Versions de « {versionsFor?.name} »</DialogTitle>
+            <DialogDescription>
+              L&apos;original importé et chaque export forment une version.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col gap-2">
+            {versionsFor?.versions.map((version) => (
+              <div
+                key={version.id}
+                className="flex items-center justify-between gap-4 rounded-md border p-3"
+              >
+                <div className="flex min-w-0 flex-col gap-1">
+                  <span className="text-sm font-medium">
+                    {version.versionNumber === 0
+                      ? "Original"
+                      : `Version ${version.versionNumber}`}
+                  </span>
+                  <span className="text-xs text-muted-foreground">
+                    {formatDate(version.createdAt)} · {formatBytes(version.fileSize)}
+                    {version.pageCount !== null ? ` · ${version.pageCount} p.` : ""}
+                  </span>
+                </div>
+                <div className="flex shrink-0 gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    nativeButton={false}
+                    render={
+                      <Link href={versionsFor ? editorUrl(versionsFor.id, version.id) : "#"} />
+                    }
+                  >
+                    <PencilIcon data-icon="inline-start" aria-hidden="true" />
+                    Ouvrir
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    nativeButton={false}
+                    render={
+                      <a href={versionsFor ? downloadUrl(versionsFor.id, version.id) : "#"} download />
+                    }
+                  >
+                    <DownloadIcon data-icon="inline-start" aria-hidden="true" />
+                    Télécharger
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <AlertDialog
+        open={deleteFor !== null}
+        onOpenChange={(open) => {
+          if (!open && !deleting) setDeleteFor(null)
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Supprimer « {deleteFor?.name} » ?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Le document et toutes ses versions seront définitivement supprimés.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleting}>Annuler</AlertDialogCancel>
+            <Button variant="destructive" disabled={deleting} onClick={handleDelete}>
+              {deleting ? <Spinner data-icon="inline-start" /> : null}
+              Supprimer
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
+  )
+}
