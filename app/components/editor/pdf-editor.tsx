@@ -16,6 +16,7 @@ import {
   PencilIcon,
   RotateCcwIcon,
   SaveIcon,
+  TagIcon,
   Trash2Icon,
   TypeIcon,
   ZoomInIcon,
@@ -49,6 +50,7 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog"
+import { Input } from "@/components/ui/input"
 import { Separator } from "@/components/ui/separator"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
@@ -86,6 +88,7 @@ const ZOOM_STEP = 0.25
 export interface VersionSummary {
   id: string
   versionNumber: number
+  name?: string | null
   fileSize: number
   pageCount: number | null
   createdAt: string
@@ -265,6 +268,33 @@ export function PdfEditor({
   const [zoom, setZoom] = useState(1)
   const [fontsReady, setFontsReady] = useState(structure.fonts.length === 0)
   const [versionList, setVersionList] = useState(versions)
+
+  const [currentDocName, setCurrentDocName] = useState(documentName)
+  const [renameDocOpen, setRenameDocOpen] = useState(false)
+  const [renameDocInput, setRenameDocInput] = useState("")
+  const [renamingDoc, setRenamingDoc] = useState(false)
+
+  async function handleRenameDoc() {
+    if (!renameDocInput.trim()) return
+    setRenamingDoc(true)
+    try {
+      const response = await fetch(`/api/documents/${documentId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: renameDocInput.trim() }),
+      })
+      if (!response.ok) {
+        toast.add({ type: "error", title: "Renommage impossible" })
+        return
+      }
+      toast.add({ type: "success", title: "Document renommé" })
+      setCurrentDocName(renameDocInput.trim())
+      setRenameDocOpen(false)
+      router.refresh()
+    } finally {
+      setRenamingDoc(false)
+    }
+  }
 
   function imageSrc(xref: number) {
     return `/api/documents/${documentId}/versions/${versionId}/images/${xref}`
@@ -581,7 +611,20 @@ export function PdfEditor({
           Mes documents
         </Button>
         <Separator orientation="vertical" className="h-5" />
-        <h1 className="min-w-0 truncate text-base font-semibold">{documentName}</h1>
+        <div className="flex items-center gap-1 min-w-0">
+          <h1 className="min-w-0 truncate text-base font-semibold">{currentDocName}</h1>
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            aria-label="Renommer le document"
+            onClick={() => {
+              setRenameDocInput(currentDocName)
+              setRenameDocOpen(true)
+            }}
+          >
+            <TagIcon aria-hidden="true" />
+          </Button>
+        </div>
         <Badge variant="secondary">
           {versionNumber === 0 ? "Original" : `Version ${versionNumber}`}
         </Badge>
@@ -629,8 +672,13 @@ export function PdfEditor({
           <VersionsDialog
             documentId={documentId}
             currentVersionId={versionId}
-            documentName={documentName}
+            documentName={currentDocName}
             versions={versionList}
+            onRenamed={(vId, newName) => {
+              setVersionList((current) =>
+                current.map((v) => (v.id === vId ? { ...v, name: newName } : v))
+              )
+            }}
             onDeleted={(deletedId, remaining) => {
               setVersionList(remaining)
               if (deletedId === versionId) {
@@ -726,6 +774,52 @@ export function PdfEditor({
           </aside>
         </div>
       )}
+
+      {/* Rename Document Dialog */}
+      <Dialog
+        open={renameDocOpen}
+        onOpenChange={(open) => {
+          if (!open && !renamingDoc) setRenameDocOpen(false)
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Renommer le document</DialogTitle>
+            <DialogDescription>
+              Entrez le nouveau nom pour ce document.
+            </DialogDescription>
+          </DialogHeader>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault()
+              handleRenameDoc()
+            }}
+            className="flex flex-col gap-4"
+          >
+            <Input
+              value={renameDocInput}
+              onChange={(e) => setRenameDocInput(e.target.value)}
+              placeholder="Nom du document"
+              required
+              autoFocus
+            />
+            <div className="flex justify-end gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                disabled={renamingDoc}
+                onClick={() => setRenameDocOpen(false)}
+              >
+                Annuler
+              </Button>
+              <Button type="submit" disabled={renamingDoc || !renameDocInput.trim()}>
+                {renamingDoc ? <Spinner data-icon="inline-start" /> : null}
+                Enregistrer
+              </Button>
+            </div>
+          </form>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }
@@ -1466,16 +1560,47 @@ function VersionsDialog({
   currentVersionId,
   documentName,
   versions,
+  onRenamed,
   onDeleted,
 }: {
   documentId: string
   currentVersionId: string
   documentName: string
   versions: VersionSummary[]
+  onRenamed: (versionId: string, newName: string | null) => void
   onDeleted: (deletedId: string, remaining: VersionSummary[]) => void
 }) {
   const [deleteTarget, setDeleteTarget] = useState<VersionSummary | null>(null)
   const [deleting, setDeleting] = useState(false)
+
+  const [renameTarget, setRenameTarget] = useState<VersionSummary | null>(null)
+  const [renameInput, setRenameInput] = useState("")
+  const [renaming, setRenaming] = useState(false)
+
+  async function handleRenameVersion() {
+    if (!renameTarget) return
+    setRenaming(true)
+    try {
+      const response = await fetch(
+        `/api/documents/${documentId}/versions/${renameTarget.id}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: renameInput.trim() }),
+        }
+      )
+      if (!response.ok) {
+        toast.add({ type: "error", title: "Renommage de version impossible" })
+        return
+      }
+      toast.add({ type: "success", title: "Version renommée" })
+      const newName = renameInput.trim() || null
+      onRenamed(renameTarget.id, newName)
+      setRenameTarget(null)
+    } finally {
+      setRenaming(false)
+    }
+  }
 
   async function handleDelete() {
     if (!deleteTarget) return
@@ -1506,117 +1631,186 @@ function VersionsDialog({
   }
 
   return (
-    <Dialog>
-      <DialogTrigger render={<Button variant="outline" size="sm" />}>
-        <HistoryIcon data-icon="inline-start" aria-hidden="true" />
-        Versions
-      </DialogTrigger>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>Versions de « {documentName} »</DialogTitle>
-          <DialogDescription>
-            Ouvrez une autre version sans quitter l&apos;éditeur.
-          </DialogDescription>
-        </DialogHeader>
-        <div className="flex max-h-[60vh] flex-col gap-2 overflow-y-auto">
-          {versions.map((version) => {
-            const isCurrent = version.id === currentVersionId
-            return (
-              <div
-                key={version.id}
-                className={cn(
-                  "flex items-center justify-between gap-4 rounded-md border p-3",
-                  isCurrent && "border-primary bg-primary/5"
-                )}
-              >
-                <div className="flex min-w-0 flex-col gap-1">
-                  <span className="flex items-center gap-2 text-sm font-medium">
-                    {version.versionNumber === 0
-                      ? "Original"
-                      : `Version ${version.versionNumber}`}
-                    {isCurrent ? <Badge variant="secondary">Actuelle</Badge> : null}
-                  </span>
-                  <span className="text-xs text-muted-foreground">
-                    {formatDate(version.createdAt)} · {formatBytes(version.fileSize)}
-                    {version.pageCount !== null ? ` · ${version.pageCount} p.` : ""}
-                  </span>
+    <>
+      <Dialog>
+        <DialogTrigger render={<Button variant="outline" size="sm" />}>
+          <HistoryIcon data-icon="inline-start" aria-hidden="true" />
+          Versions
+        </DialogTrigger>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Versions de « {documentName} »</DialogTitle>
+            <DialogDescription>
+              Ouvrez une autre version sans quitter l&apos;éditeur.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex max-h-[60vh] flex-col gap-2 overflow-y-auto">
+            {versions.map((version) => {
+              const isCurrent = version.id === currentVersionId
+              return (
+                <div
+                  key={version.id}
+                  className={cn(
+                    "flex items-center justify-between gap-4 rounded-md border p-3",
+                    isCurrent && "border-primary bg-primary/5"
+                  )}
+                >
+                  <div className="flex min-w-0 flex-col gap-1">
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-medium truncate">
+                        {version.name
+                          ? version.name
+                          : version.versionNumber === 0
+                            ? "Original"
+                            : `Version ${version.versionNumber}`}
+                      </span>
+                      {version.name ? (
+                        <Badge variant="secondary">v{version.versionNumber}</Badge>
+                      ) : null}
+                      {isCurrent ? <Badge variant="secondary">Actuelle</Badge> : null}
+                    </div>
+                    <span className="text-xs text-muted-foreground">
+                      {formatDate(version.createdAt)} · {formatBytes(version.fileSize)}
+                      {version.pageCount !== null ? ` · ${version.pageCount} p.` : ""}
+                    </span>
+                  </div>
+                  <div className="flex shrink-0 gap-2">
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label="Renommer la version"
+                      onClick={() => {
+                        setRenameTarget(version)
+                        setRenameInput(version.name || "")
+                      }}
+                    >
+                      <TagIcon aria-hidden="true" />
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={isCurrent}
+                      nativeButton={false}
+                      render={
+                        <Link
+                          href={`/documents/${documentId}/versions/${version.id}`}
+                        />
+                      }
+                    >
+                      <PencilIcon data-icon="inline-start" aria-hidden="true" />
+                      Ouvrir
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      nativeButton={false}
+                      render={
+                        <a
+                          href={`/api/documents/${documentId}/versions/${version.id}/download`}
+                          download
+                        />
+                      }
+                    >
+                      <DownloadIcon data-icon="inline-start" aria-hidden="true" />
+                      Télécharger
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label="Supprimer la version"
+                      disabled={versions.length <= 1}
+                      onClick={() => setDeleteTarget(version)}
+                    >
+                      <Trash2Icon aria-hidden="true" />
+                    </Button>
+                  </div>
                 </div>
-                <div className="flex shrink-0 gap-2">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={isCurrent}
-                    nativeButton={false}
-                    render={
-                      <Link
-                        href={`/documents/${documentId}/versions/${version.id}`}
-                      />
-                    }
-                  >
-                    <PencilIcon data-icon="inline-start" aria-hidden="true" />
-                    Ouvrir
-                  </Button>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    nativeButton={false}
-                    render={
-                      <a
-                        href={`/api/documents/${documentId}/versions/${version.id}/download`}
-                        download
-                      />
-                    }
-                  >
-                    <DownloadIcon data-icon="inline-start" aria-hidden="true" />
-                    Télécharger
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="icon-sm"
-                    aria-label="Supprimer la version"
-                    disabled={versions.length <= 1}
-                    onClick={() => setDeleteTarget(version)}
-                  >
-                    <Trash2Icon aria-hidden="true" />
-                  </Button>
-                </div>
-              </div>
-            )
-          })}
-        </div>
-      </DialogContent>
+              )
+            })}
+          </div>
+        </DialogContent>
 
-      <AlertDialog
-        open={deleteTarget !== null}
+        <AlertDialog
+          open={deleteTarget !== null}
+          onOpenChange={(open) => {
+            if (!open && !deleting) setDeleteTarget(null)
+          }}
+        >
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>
+                Supprimer{" "}
+                {deleteTarget?.versionNumber === 0
+                  ? "l'original"
+                  : `la version ${deleteTarget?.versionNumber}`}{" "}
+                ?
+              </AlertDialogTitle>
+              <AlertDialogDescription>
+                {deleteTarget?.id === currentVersionId
+                  ? "C'est la version actuellement ouverte : l'éditeur basculera sur la version la plus récente restante."
+                  : "Cette version sera définitivement supprimée."}
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel disabled={deleting}>Annuler</AlertDialogCancel>
+              <Button variant="destructive" disabled={deleting} onClick={handleDelete}>
+                {deleting ? <Spinner data-icon="inline-start" /> : null}
+                Supprimer
+              </Button>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+      </Dialog>
+
+      {/* Rename Version Dialog */}
+      <Dialog
+        open={renameTarget !== null}
         onOpenChange={(open) => {
-          if (!open && !deleting) setDeleteTarget(null)
+          if (!open && !renaming) setRenameTarget(null)
         }}
       >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>
-              Supprimer{" "}
-              {deleteTarget?.versionNumber === 0
-                ? "l'original"
-                : `la version ${deleteTarget?.versionNumber}`}{" "}
-              ?
-            </AlertDialogTitle>
-            <AlertDialogDescription>
-              {deleteTarget?.id === currentVersionId
-                ? "C'est la version actuellement ouverte : l'éditeur basculera sur la version la plus récente restante."
-                : "Cette version sera définitivement supprimée."}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={deleting}>Annuler</AlertDialogCancel>
-            <Button variant="destructive" disabled={deleting} onClick={handleDelete}>
-              {deleting ? <Spinner data-icon="inline-start" /> : null}
-              Supprimer
-            </Button>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-    </Dialog>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Renommer la version</DialogTitle>
+            <DialogDescription>
+              Donnez un nom personnalisé à cette version (ex : &quot;Version finale&quot;).
+            </DialogDescription>
+          </DialogHeader>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault()
+              handleRenameVersion()
+            }}
+            className="flex flex-col gap-4"
+          >
+            <Input
+              value={renameInput}
+              onChange={(e) => setRenameInput(e.target.value)}
+              placeholder={
+                renameTarget?.versionNumber === 0
+                  ? "Original"
+                  : `Version ${renameTarget?.versionNumber}`
+              }
+              autoFocus
+            />
+            <div className="flex justify-end gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                disabled={renaming}
+                onClick={() => setRenameTarget(null)}
+              >
+                Annuler
+              </Button>
+              <Button type="submit" disabled={renaming}>
+                {renaming ? <Spinner data-icon="inline-start" /> : null}
+                Enregistrer
+              </Button>
+            </div>
+          </form>
+        </DialogContent>
+      </Dialog>
+    </>
   )
 }
 

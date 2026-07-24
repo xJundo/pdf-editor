@@ -1,6 +1,7 @@
 export interface DocumentVersionItem {
   id: string
   versionNumber: number
+  name?: string | null
   fileSize: number
   pageCount: number | null
   createdAt: string

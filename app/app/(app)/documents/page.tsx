@@ -23,6 +23,7 @@ export default async function DocumentsPage() {
     versions: doc.versions.map((version) => ({
       id: version.id,
       versionNumber: version.versionNumber,
+      name: version.name,
       fileSize: version.fileSize,
       pageCount: version.pageCount,
       createdAt: version.createdAt.toISOString(),

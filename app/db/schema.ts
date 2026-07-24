@@ -33,6 +33,7 @@ export const documentVersions = pgTable(
       .notNull()
       .references(() => documents.id, { onDelete: "cascade" }),
     versionNumber: integer("version_number").notNull(),
+    name: text("name"),
     sourceVersionId: uuid("source_version_id"),
     filePath: text("file_path").notNull(),
     fileSize: bigint("file_size", { mode: "number" }).notNull(),

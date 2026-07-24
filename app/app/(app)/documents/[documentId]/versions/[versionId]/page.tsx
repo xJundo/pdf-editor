@@ -48,6 +48,7 @@ export default async function EditorPage({
       versions={versions.map((v) => ({
         id: v.id,
         versionNumber: v.versionNumber,
+        name: v.name,
         fileSize: Number(v.fileSize),
         pageCount: v.pageCount,
         createdAt: v.createdAt.toISOString(),

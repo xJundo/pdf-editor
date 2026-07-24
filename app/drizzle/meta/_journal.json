@@ -15,6 +15,13 @@
       "when": 1784886261616,
       "tag": "0001_mixed_killer_shrike",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1784914578557,
+      "tag": "0002_fancy_doomsday",
+      "breakpoints": true
     }
   ]
 }

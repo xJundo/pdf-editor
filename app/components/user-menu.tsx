@@ -3,6 +3,7 @@
 import { useRouter } from "next/navigation"
 import { ChevronDownIcon, LogOutIcon } from "lucide-react"
 
+import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 import { Button } from "@/components/ui/button"
 import {
   DropdownMenu,
@@ -19,22 +20,63 @@ export function UserMenu({ name, email }: { name: string; email: string }) {
   const router = useRouter()
 
   async function handleSignOut() {
-    await authClient.signOut()
-    router.push("/login")
-    router.refresh()
+    await authClient.signOut({
+      fetchOptions: {
+        onSuccess: () => {
+          router.push("/login")
+          router.refresh()
+        },
+      },
+    })
   }
+
+  const initials = (name || email || "U")
+    .trim()
+    .split(/\s+/)
+    .map((part) => part[0])
+    .join("")
+    .substring(0, 2)
+    .toUpperCase()
 
   return (
     <DropdownMenu>
-      <DropdownMenuTrigger render={<Button variant="ghost" size="sm" />}>
-        {name}
-        <ChevronDownIcon data-icon="inline-end" aria-hidden="true" />
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end">
-        <DropdownMenuLabel>{email}</DropdownMenuLabel>
+      <DropdownMenuTrigger
+        render={
+          <Button variant="ghost" className="gap-2 px-2 h-9 rounded-full font-normal">
+            <Avatar className="size-6">
+              <AvatarFallback className="text-[10px] font-semibold">
+                {initials}
+              </AvatarFallback>
+            </Avatar>
+            <span className="max-w-[120px] truncate text-sm font-medium">
+              {name || email}
+            </span>
+            <ChevronDownIcon
+              data-icon="inline-end"
+              className="text-muted-foreground"
+              aria-hidden="true"
+            />
+          </Button>
+        }
+      />
+      <DropdownMenuContent align="end" className="w-56">
+        <DropdownMenuGroup>
+          <DropdownMenuLabel className="font-normal">
+            <div className="flex flex-col gap-1">
+              <p className="text-sm font-medium leading-none">{name}</p>
+              <p className="text-xs leading-none text-muted-foreground truncate">
+                {email}
+              </p>
+            </div>
+          </DropdownMenuLabel>
+        </DropdownMenuGroup>
         <DropdownMenuSeparator />
         <DropdownMenuGroup>
-          <DropdownMenuItem onClick={handleSignOut}>
+          <DropdownMenuItem
+            onClick={handleSignOut}
+            variant="destructive"
+            className="cursor-pointer"
+          >
             <LogOutIcon aria-hidden="true" />
             Se déconnecter
           </DropdownMenuItem>
@@ -43,3 +85,4 @@ export function UserMenu({ name, email }: { name: string; email: string }) {
     </DropdownMenu>
   )
 }
+

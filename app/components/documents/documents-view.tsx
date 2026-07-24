@@ -9,6 +9,7 @@ import {
   HistoryIcon,
   MoreHorizontalIcon,
   PencilIcon,
+  TagIcon,
   Trash2Icon,
 } from "lucide-react"
 
@@ -48,6 +49,7 @@ import {
   EmptyMedia,
   EmptyTitle,
 } from "@/components/ui/empty"
+import { Input } from "@/components/ui/input"
 import { Spinner } from "@/components/ui/spinner"
 import {
   Table,
@@ -76,6 +78,74 @@ export function DocumentsView({ documents }: { documents: DocumentItem[] }) {
     null
   )
   const [deletingVersion, setDeletingVersion] = useState(false)
+
+  // Rename document state
+  const [renameDocFor, setRenameDocFor] = useState<DocumentItem | null>(null)
+  const [renameDocName, setRenameDocName] = useState("")
+  const [renamingDoc, setRenamingDoc] = useState(false)
+
+  // Rename version state
+  const [renameVersionFor, setRenameVersionFor] = useState<DocumentVersionItem | null>(
+    null
+  )
+  const [renameVersionName, setRenameVersionName] = useState("")
+  const [renamingVersion, setRenamingVersion] = useState(false)
+
+  async function handleRenameDoc() {
+    if (!renameDocFor || !renameDocName.trim()) return
+    setRenamingDoc(true)
+    try {
+      const response = await fetch(`/api/documents/${renameDocFor.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: renameDocName.trim() }),
+      })
+      if (!response.ok) {
+        toast.add({ type: "error", title: "Renommage impossible" })
+        return
+      }
+      toast.add({ type: "success", title: "Document renommé" })
+      setRenameDocFor(null)
+      router.refresh()
+    } finally {
+      setRenamingDoc(false)
+    }
+  }
+
+  async function handleRenameVersion() {
+    if (!versionsFor || !renameVersionFor) return
+    setRenamingVersion(true)
+    try {
+      const response = await fetch(
+        `/api/documents/${versionsFor.id}/versions/${renameVersionFor.id}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: renameVersionName.trim() }),
+        }
+      )
+      if (!response.ok) {
+        toast.add({ type: "error", title: "Renommage de version impossible" })
+        return
+      }
+      toast.add({ type: "success", title: "Version renommée" })
+      const newName = renameVersionName.trim() || null
+      setVersionsFor((current) =>
+        current
+          ? {
+              ...current,
+              versions: current.versions.map((v) =>
+                v.id === renameVersionFor.id ? { ...v, name: newName } : v
+              ),
+            }
+          : current
+      )
+      setRenameVersionFor(null)
+      router.refresh()
+    } finally {
+      setRenamingVersion(false)
+    }
+  }
 
   async function handleDelete() {
     if (!deleteFor) return
@@ -200,6 +270,15 @@ export function DocumentsView({ documents }: { documents: DocumentItem[] }) {
                                 Ouvrir dans l&apos;éditeur
                               </DropdownMenuItem>
                             ) : null}
+                            <DropdownMenuItem
+                              onClick={() => {
+                                setRenameDocFor(doc)
+                                setRenameDocName(doc.name)
+                              }}
+                            >
+                              <TagIcon aria-hidden="true" />
+                              Renommer le document
+                            </DropdownMenuItem>
                             {latest ? (
                               <DropdownMenuItem
                                 render={
@@ -236,6 +315,53 @@ export function DocumentsView({ documents }: { documents: DocumentItem[] }) {
         </div>
       )}
 
+      {/* Rename Document Dialog */}
+      <Dialog
+        open={renameDocFor !== null}
+        onOpenChange={(open) => {
+          if (!open && !renamingDoc) setRenameDocFor(null)
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Renommer le document</DialogTitle>
+            <DialogDescription>
+              Entrez le nouveau nom pour ce document.
+            </DialogDescription>
+          </DialogHeader>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault()
+              handleRenameDoc()
+            }}
+            className="flex flex-col gap-4"
+          >
+            <Input
+              value={renameDocName}
+              onChange={(e) => setRenameDocName(e.target.value)}
+              placeholder="Nom du document"
+              required
+              autoFocus
+            />
+            <div className="flex justify-end gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                disabled={renamingDoc}
+                onClick={() => setRenameDocFor(null)}
+              >
+                Annuler
+              </Button>
+              <Button type="submit" disabled={renamingDoc || !renameDocName.trim()}>
+                {renamingDoc ? <Spinner data-icon="inline-start" /> : null}
+                Enregistrer
+              </Button>
+            </div>
+          </form>
+        </DialogContent>
+      </Dialog>
+
+      {/* Versions List Dialog */}
       <Dialog
         open={versionsFor !== null}
         onOpenChange={(open) => !open && setVersionsFor(null)}
@@ -254,17 +380,35 @@ export function DocumentsView({ documents }: { documents: DocumentItem[] }) {
                 className="flex items-center justify-between gap-4 rounded-md border p-3"
               >
                 <div className="flex min-w-0 flex-col gap-1">
-                  <span className="text-sm font-medium">
-                    {version.versionNumber === 0
-                      ? "Original"
-                      : `Version ${version.versionNumber}`}
-                  </span>
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-medium truncate">
+                      {version.name
+                        ? version.name
+                        : version.versionNumber === 0
+                          ? "Original"
+                          : `Version ${version.versionNumber}`}
+                    </span>
+                    {version.name ? (
+                      <Badge variant="secondary">v{version.versionNumber}</Badge>
+                    ) : null}
+                  </div>
                   <span className="text-xs text-muted-foreground">
                     {formatDate(version.createdAt)} · {formatBytes(version.fileSize)}
                     {version.pageCount !== null ? ` · ${version.pageCount} p.` : ""}
                   </span>
                 </div>
                 <div className="flex shrink-0 gap-2">
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label="Renommer la version"
+                    onClick={() => {
+                      setRenameVersionFor(version)
+                      setRenameVersionName(version.name || "")
+                    }}
+                  >
+                    <TagIcon aria-hidden="true" />
+                  </Button>
                   <Button
                     variant="outline"
                     size="sm"
@@ -300,6 +444,55 @@ export function DocumentsView({ documents }: { documents: DocumentItem[] }) {
               </div>
             ))}
           </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Rename Version Dialog */}
+      <Dialog
+        open={renameVersionFor !== null}
+        onOpenChange={(open) => {
+          if (!open && !renamingVersion) setRenameVersionFor(null)
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Renommer la version</DialogTitle>
+            <DialogDescription>
+              Donnez un nom personnalisé à cette version (ex : &quot;Version finale&quot;).
+            </DialogDescription>
+          </DialogHeader>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault()
+              handleRenameVersion()
+            }}
+            className="flex flex-col gap-4"
+          >
+            <Input
+              value={renameVersionName}
+              onChange={(e) => setRenameVersionName(e.target.value)}
+              placeholder={
+                renameVersionFor?.versionNumber === 0
+                  ? "Original"
+                  : `Version ${renameVersionFor?.versionNumber}`
+              }
+              autoFocus
+            />
+            <div className="flex justify-end gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                disabled={renamingVersion}
+                onClick={() => setRenameVersionFor(null)}
+              >
+                Annuler
+              </Button>
+              <Button type="submit" disabled={renamingVersion}>
+                {renamingVersion ? <Spinner data-icon="inline-start" /> : null}
+                Enregistrer
+              </Button>
+            </div>
+          </form>
         </DialogContent>
       </Dialog>
 
@@ -362,3 +555,4 @@ export function DocumentsView({ documents }: { documents: DocumentItem[] }) {
     </>
   )
 }
+

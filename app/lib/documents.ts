@@ -11,6 +11,7 @@ export async function getOwnedVersion(userId: string, documentId: string, versio
     .select({
       versionId: documentVersions.id,
       versionNumber: documentVersions.versionNumber,
+      versionName: documentVersions.name,
       filePath: documentVersions.filePath,
       pageCount: documentVersions.pageCount,
       documentId: documents.id,
@@ -34,6 +35,7 @@ export async function getDocumentVersions(userId: string, documentId: string) {
     .select({
       id: documentVersions.id,
       versionNumber: documentVersions.versionNumber,
+      name: documentVersions.name,
       fileSize: documentVersions.fileSize,
       pageCount: documentVersions.pageCount,
       createdAt: documentVersions.createdAt,
