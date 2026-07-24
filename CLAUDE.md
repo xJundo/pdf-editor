@@ -27,7 +27,7 @@ Typographie : réemployer la police embarquée si les glyphes nécessaires exist
 ## Plan de développement (état d'avancement)
 
 - [x] **Étape 1 — Socle** : scaffolding Next.js + shadcn, FastAPI + PyMuPDF, docker-compose (Coolify), Postgres + Drizzle, healthchecks. Critère : `docker compose up` fonctionne de bout en bout. ✅ vérifié le 2026-07-24 (health app+db+pdf-service, migrations auto, volume partagé lisible/inscriptible des deux côtés, garde anti path-traversal).
-- [ ] **Étape 2 — Auth + Mes documents** : Better Auth (email/mdp, sessions), upload PDF (validation type/taille), page "Mes documents" (liste, versions, suppression), cloisonnement strict par utilisateur.
+- [x] **Étape 2 — Auth + Mes documents** : Better Auth (email/mdp, sessions), upload PDF (validation type/taille), page "Mes documents" (liste, versions, suppression), cloisonnement strict par utilisateur. ✅ vérifié le 2026-07-24 en dev ET dans la stack Docker (signup/login, upload+magic bytes, download, suppression, accès inter-utilisateurs → 404, redirection des pages protégées).
 - [ ] **Étape 3 — Visionneuse + extraction** : rendu pdf.js multi-pages, endpoint d'extraction de structure, calque interactif (survol/sélection spans + images).
 - [ ] **Étape 4 — MVP édition de texte** : édition inline avec style détecté → journal d'opérations → export → nouvelle version réouvrable. Suppression des champs de signature. **Fin du MVP.**
 - [ ] **Étape 5 — Images** : suppression et remplacement d'images existantes (image de substitution redimensionnée dans la bbox d'origine).
@@ -49,4 +49,6 @@ Mettre à jour les cases à cocher au fil des sessions.
 - Test prod local : `POSTGRES_PASSWORD=... docker compose -f docker-compose.yml -f compose.local.yml up --build` (le compose principal ne mappe aucun port hôte — c'est Coolify/Traefik qui route vers `app:3000` en prod).
 - Migrations : `npm run db:generate` après modif du schéma (commiter `app/drizzle/`) ; appliquées automatiquement au démarrage du conteneur, ou `npm run db:migrate` en dev.
 - Secrets attendus : voir `.env.example`.
-- Piège connu : si `npm ci` échoue dans le build Docker avec "Missing @emnapi/... from lock file" (bug npm sur les deps optionnelles par plateforme), régénérer le lockfile : `rm -rf node_modules package-lock.json && npm install` dans `app/`.
+- Piège connu : si `npm ci` échoue dans le build Docker avec "Missing @emnapi/... from lock file" (bug npm sur les deps optionnelles par plateforme, réintroduit à chaque `npm install <pkg>` local), régénérer le lockfile : `rm -rf node_modules package-lock.json && npm install` dans `app/`. Le Dockerfile épingle aussi npm à la version locale (11.6.2) pour immuniser le build — garder les deux versions alignées.
+- Auth : Better Auth. Schéma généré dans `app/db/auth-schema.ts` (ne pas éditer à la main — régénérer via `npx @better-auth/cli generate --config lib/auth.ts --output db/auth-schema.ts` après changement de config), ré-exporté par `db/schema.ts`. Helpers : `lib/session.ts` (`getSession`, `requireSession`), client React `lib/auth-client.ts`.
+- UI : projet Base UI (pas Radix) → les triggers utilisent `render={<Button/>}`, le toast s'utilise via `toast.add({type, title, description})` (`components/ui/toast.tsx`, `<Toaster>` monté dans le layout racine).
