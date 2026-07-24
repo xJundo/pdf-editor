@@ -158,6 +158,8 @@ export interface PdfImage {
   id: string
   xref: number
   bbox: BBox
+  /** Near-full-page flattened background: rendered but not interactive. */
+  background?: boolean
 }
 
 export interface PdfPageStructure {

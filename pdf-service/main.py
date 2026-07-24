@@ -72,6 +72,11 @@ def document_info(path: str) -> dict:
 _FLAG_ITALIC = 1 << 1
 _FLAG_BOLD = 1 << 4
 
+# Images covering at least this fraction of the page are treated as flattened
+# backgrounds/templates: shown, but not interactive (so text on top stays
+# editable and empty areas don't select the whole-page image).
+_BACKGROUND_COVERAGE = 0.9
+
 
 def _color_to_hex(color: int) -> str:
     return f"#{color:06x}"
@@ -199,6 +204,7 @@ def document_structure(path: str) -> dict:
                                 }
                             )
                 images = []
+                page_area = page.rect.width * page.rect.height
                 # get_image_info reflects images actually drawn on the page
                 # (get_images also lists stale resources left by earlier
                 # replace/delete operations). Skip inline images (xref 0,
@@ -208,11 +214,17 @@ def document_structure(path: str) -> dict:
                         continue
                     if info["width"] <= 1 and info["height"] <= 1:
                         continue
+                    bbox = info["bbox"]
+                    # A near-full-page image is a flattened template/background
+                    # painted under the real text. Its interactive overlay must
+                    # not swallow clicks meant for the text spans on top of it.
+                    coverage = ((bbox[2] - bbox[0]) * (bbox[3] - bbox[1])) / page_area
                     images.append(
                         {
                             "id": f"p{page_index}-i{image_index}",
                             "xref": info["xref"],
-                            "bbox": list(info["bbox"]),
+                            "bbox": list(bbox),
+                            "background": coverage >= _BACKGROUND_COVERAGE,
                         }
                     )
                 pages.append(

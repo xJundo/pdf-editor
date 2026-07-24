@@ -985,7 +985,9 @@ function PdfPageView({
               title={effectiveText}
               aria-label={`Texte : ${effectiveText}`}
               className={cn(
-                "absolute cursor-text rounded-xs text-left whitespace-nowrap",
+                // z-10 keeps text spans above image overlays so text drawn on
+                // top of an image (e.g. a stamp) stays clickable.
+                "absolute z-10 cursor-text rounded-xs text-left whitespace-pre",
                 edited ? "bg-white" : "bg-transparent text-transparent",
                 isSelected
                   ? "ring-2 ring-primary"
@@ -1019,6 +1021,12 @@ function PdfPageView({
       })}
 
       {page.images.map((image) => {
+        // A near-full-page flattened background is already painted by the
+        // pdf.js canvas; giving it an interactive overlay would swallow every
+        // click meant for the text spans drawn on top of it, making the whole
+        // page read as one image. Skip its overlay entirely.
+        if (image.background) return null
+
         const edit = imageEdits[image.id]
         const isSelected =
           selection?.type === "image" &&
