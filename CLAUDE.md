@@ -1,0 +1,52 @@
+# PDF Editor (type sejda.com)
+
+Application web self-hosted d'édition de PDF : l'utilisateur importe un PDF, modifie le **contenu existant** (texte en place, images), puis exporte une nouvelle version. Déploiement sur VPS Hostinger via Coolify (100% Docker, pas de Nginx à configurer — Coolify/Traefik gère le proxy et le TLS).
+
+## Architecture (3 conteneurs)
+
+| Service | Chemin | Techno | Rôle |
+|---|---|---|---|
+| `app` | `app/` | Next.js 16 (App Router, Turbopack) + shadcn/ui (preset base-nova, Base UI) + Tailwind v4 + pdf.js | UI, auth (Better Auth), API documents/versions, rendu PDF |
+| `pdf-service` | `pdf-service/` | Python FastAPI + PyMuPDF | Extraction de structure (spans texte + images), application des éditions, export. **Réseau interne uniquement, jamais exposé** |
+| `db` | — | PostgreSQL 17 | users, documents, document_versions |
+
+- ORM : **Drizzle** (schéma dans `app/db/schema.ts`, migrations SQL générées par `npm run db:generate` dans `app/drizzle/`, appliquées au démarrage du conteneur `app` par `app/scripts/migrate.mjs`). Attention : la sortie standalone de Next bundle les deps serveur, donc l'image Docker installe drizzle-orm+pg séparément pour le script de migration (voir `app/Dockerfile`).
+- Fichiers PDF : volume Docker `pdf_files` monté dans `app` et `pdf-service` sous `/data/files/<userId>/<documentId>/<versionId>.pdf`. Les binaires ne vont JAMAIS en base.
+- Versions **immuables** : l'original importé = version 0 ; chaque export crée une nouvelle version ; toute version est réouvrable dans l'éditeur.
+- PDF signés : édités comme les autres ; les champs de signature sont supprimés à l'export (aucune préservation/re-signature requise — décision validée).
+
+## Flux d'édition (cœur du produit)
+
+1. Upload → disque + ligne en base (version 0).
+2. Ouverture éditeur → `pdf-service` extrait la structure : spans de texte (bbox, police, taille, couleur, flags gras/italique) et images (bbox) → le front superpose des calques interactifs alignés sur le rendu pdf.js.
+3. Le front accumule un **journal d'opérations** JSON (modif texte, remplacement/suppression image).
+4. Export → `pdf-service` rejoue le journal sur le PDF source (rédaction ciblée + réinsertion pour le texte, `replace_image`/`delete_image` pour les images) → nouvelle version.
+
+Typographie : réemployer la police embarquée si les glyphes nécessaires existent (vérif fontTools) ; sinon repli sur une police libre proche (Noto/Liberation) en conservant taille/couleur/graisse. Les polices embarquées sont souvent des sous-ensembles : c'est LA difficulté connue du projet.
+
+## Plan de développement (état d'avancement)
+
+- [x] **Étape 1 — Socle** : scaffolding Next.js + shadcn, FastAPI + PyMuPDF, docker-compose (Coolify), Postgres + Drizzle, healthchecks. Critère : `docker compose up` fonctionne de bout en bout. ✅ vérifié le 2026-07-24 (health app+db+pdf-service, migrations auto, volume partagé lisible/inscriptible des deux côtés, garde anti path-traversal).
+- [ ] **Étape 2 — Auth + Mes documents** : Better Auth (email/mdp, sessions), upload PDF (validation type/taille), page "Mes documents" (liste, versions, suppression), cloisonnement strict par utilisateur.
+- [ ] **Étape 3 — Visionneuse + extraction** : rendu pdf.js multi-pages, endpoint d'extraction de structure, calque interactif (survol/sélection spans + images).
+- [ ] **Étape 4 — MVP édition de texte** : édition inline avec style détecté → journal d'opérations → export → nouvelle version réouvrable. Suppression des champs de signature. **Fin du MVP.**
+- [ ] **Étape 5 — Images** : suppression et remplacement d'images existantes (image de substitution redimensionnée dans la bbox d'origine).
+- [ ] **Étape 6 — Fidélité typographique avancée** : réemploi polices embarquées, mapping vers polices libres, gras/italique fin, multi-lignes/retaillage.
+- [ ] **Étape 7 — Durcissement + déploiement** : limites taille/quota, traitement asynchrone des gros PDF, nettoyage fichiers orphelins, corpus de test (Word, scannés, signés), déploiement Coolify.
+
+Mettre à jour les cases à cocher au fil des sessions.
+
+## Conventions
+
+- **UI en français** (libellés : "Mes documents", etc.). Code, identifiants et commits en anglais.
+- **shadcn/ui obligatoire pour l'UI** : suivre le skill `.agents/skills/shadcn/SKILL.md` (composants via `npx shadcn@latest add`, tokens sémantiques, `FieldGroup`/`Field` pour les formulaires, jamais de `space-y-*`, icônes avec `data-icon`).
+- `app` est le seul service exposé (port 3000). `pdf-service` n'est joignable que via le réseau Docker interne (`PDF_SERVICE_URL`).
+- Toute requête documents/versions filtre par `userId` de la session — jamais de confiance dans un id client.
+
+## Commandes
+
+- Dev local : `docker compose -f compose.dev.yml up -d` (Postgres seul), puis `npm run dev` dans `app/` et `.venv/bin/uvicorn main:app --reload --port 8000` dans `pdf-service/` (venv : `pdf-service/.venv`).
+- Test prod local : `POSTGRES_PASSWORD=... docker compose -f docker-compose.yml -f compose.local.yml up --build` (le compose principal ne mappe aucun port hôte — c'est Coolify/Traefik qui route vers `app:3000` en prod).
+- Migrations : `npm run db:generate` après modif du schéma (commiter `app/drizzle/`) ; appliquées automatiquement au démarrage du conteneur, ou `npm run db:migrate` en dev.
+- Secrets attendus : voir `.env.example`.
+- Piège connu : si `npm ci` échoue dans le build Docker avec "Missing @emnapi/... from lock file" (bug npm sur les deps optionnelles par plateforme), régénérer le lockfile : `rm -rf node_modules package-lock.json && npm install` dans `app/`.

@@ -1,0 +1,6 @@
+# Override for testing the production stack locally (Coolify does the
+# routing in production, so docker-compose.yml maps no host ports).
+services:
+  app:
+    ports:
+      - "3000:3000"

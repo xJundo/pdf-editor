@@ -1,0 +1,45 @@
+# Production deployment, designed for Coolify.
+#
+# No host port bindings here: `app` is the only public-facing service and
+# Coolify's proxy (Traefik) routes the configured domain to its port 3000.
+# For a full local production test, add the override file:
+#   docker compose -f docker-compose.yml -f compose.local.yml up --build
+services:
+  app:
+    build: ./app
+    environment:
+      DATABASE_URL: postgres://pdfeditor:${POSTGRES_PASSWORD:?}@db:5432/pdfeditor
+      PDF_SERVICE_URL: http://pdf-service:8000
+      FILES_ROOT: /data/files
+    volumes:
+      - pdf_files:/data/files
+    depends_on:
+      db:
+        condition: service_healthy
+      pdf-service:
+        condition: service_healthy
+
+  pdf-service:
+    build: ./pdf-service
+    environment:
+      FILES_ROOT: /data/files
+    volumes:
+      - pdf_files:/data/files
+
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: pdfeditor
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      POSTGRES_DB: pdfeditor
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pdfeditor -d pdfeditor"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pdf_files:
+  pg_data:

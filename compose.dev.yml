@@ -1,0 +1,17 @@
+# Local development: only Postgres runs in Docker.
+# App:         cd app && npm run dev
+# PDF service: cd pdf-service && .venv/bin/uvicorn main:app --reload --port 8000
+services:
+  db:
+    image: postgres:17-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: pdfeditor
+      POSTGRES_PASSWORD: pdfeditor
+      POSTGRES_DB: pdfeditor
+    volumes:
+      - pg_data_dev:/var/lib/postgresql/data
+
+volumes:
+  pg_data_dev:
