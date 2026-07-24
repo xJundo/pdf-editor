@@ -37,6 +37,8 @@ export default async function EditorPage({
 
   return (
     <PdfEditor
+      documentId={documentId}
+      versionId={versionId}
       fileUrl={`/api/documents/${documentId}/versions/${versionId}/file`}
       structure={structure}
       documentName={version.name}

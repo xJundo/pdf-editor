@@ -39,3 +39,27 @@ export async function getPdfStructure(
 ): Promise<import("./pdf-structure").PdfStructure> {
   return callPdfService("/documents/structure", relativePath)
 }
+
+export interface ExportResult {
+  pageCount: number
+  deletedSignatureFields: number
+}
+
+/** Replays the edit journal on sourcePath and writes the result to targetPath. */
+export async function exportPdf(
+  sourcePath: string,
+  targetPath: string,
+  operations: import("./pdf-structure").EditOperation[]
+): Promise<ExportResult> {
+  const response = await fetch(new URL("/documents/export", PDF_SERVICE_URL), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sourcePath, targetPath, operations }),
+    cache: "no-store",
+  })
+  if (!response.ok) {
+    const body = await response.text().catch(() => "")
+    throw new PdfServiceError(`pdf-service: ${response.status} ${body}`, response.status)
+  }
+  return response.json()
+}
