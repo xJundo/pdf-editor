@@ -13,7 +13,7 @@ import {
 } from "lucide-react"
 
 import { UploadButton } from "@/components/documents/upload-button"
-import type { DocumentItem } from "@/components/documents/types"
+import type { DocumentItem, DocumentVersionItem } from "@/components/documents/types"
 import { formatBytes, formatDate } from "@/components/documents/types"
 import {
   AlertDialog,
@@ -72,6 +72,10 @@ export function DocumentsView({ documents }: { documents: DocumentItem[] }) {
   const [versionsFor, setVersionsFor] = useState<DocumentItem | null>(null)
   const [deleteFor, setDeleteFor] = useState<DocumentItem | null>(null)
   const [deleting, setDeleting] = useState(false)
+  const [deleteVersionFor, setDeleteVersionFor] = useState<DocumentVersionItem | null>(
+    null
+  )
+  const [deletingVersion, setDeletingVersion] = useState(false)
 
   async function handleDelete() {
     if (!deleteFor) return
@@ -87,6 +91,39 @@ export function DocumentsView({ documents }: { documents: DocumentItem[] }) {
       router.refresh()
     } finally {
       setDeleting(false)
+    }
+  }
+
+  async function handleDeleteVersion() {
+    if (!versionsFor || !deleteVersionFor) return
+    setDeletingVersion(true)
+    try {
+      const response = await fetch(
+        `/api/documents/${versionsFor.id}/versions/${deleteVersionFor.id}`,
+        { method: "DELETE" }
+      )
+      if (!response.ok) {
+        const data = await response.json().catch(() => null)
+        toast.add({
+          type: "error",
+          title: "Suppression impossible",
+          description: data?.error,
+        })
+        return
+      }
+      toast.add({ type: "success", title: "Version supprimée" })
+      setVersionsFor((current) =>
+        current
+          ? {
+              ...current,
+              versions: current.versions.filter((v) => v.id !== deleteVersionFor.id),
+            }
+          : current
+      )
+      setDeleteVersionFor(null)
+      router.refresh()
+    } finally {
+      setDeletingVersion(false)
     }
   }
 
@@ -250,6 +287,15 @@ export function DocumentsView({ documents }: { documents: DocumentItem[] }) {
                     <DownloadIcon data-icon="inline-start" aria-hidden="true" />
                     Télécharger
                   </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label="Supprimer la version"
+                    disabled={(versionsFor?.versions.length ?? 0) <= 1}
+                    onClick={() => setDeleteVersionFor(version)}
+                  >
+                    <Trash2Icon aria-hidden="true" />
+                  </Button>
                 </div>
               </div>
             ))}
@@ -274,6 +320,40 @@ export function DocumentsView({ documents }: { documents: DocumentItem[] }) {
             <AlertDialogCancel disabled={deleting}>Annuler</AlertDialogCancel>
             <Button variant="destructive" disabled={deleting} onClick={handleDelete}>
               {deleting ? <Spinner data-icon="inline-start" /> : null}
+              Supprimer
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog
+        open={deleteVersionFor !== null}
+        onOpenChange={(open) => {
+          if (!open && !deletingVersion) setDeleteVersionFor(null)
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              Supprimer{" "}
+              {deleteVersionFor?.versionNumber === 0
+                ? "l'original"
+                : `la version ${deleteVersionFor?.versionNumber}`}{" "}
+              ?
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              Cette version sera définitivement supprimée. Les autres versions du
+              document ne sont pas affectées.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deletingVersion}>Annuler</AlertDialogCancel>
+            <Button
+              variant="destructive"
+              disabled={deletingVersion}
+              onClick={handleDeleteVersion}
+            >
+              {deletingVersion ? <Spinner data-icon="inline-start" /> : null}
               Supprimer
             </Button>
           </AlertDialogFooter>

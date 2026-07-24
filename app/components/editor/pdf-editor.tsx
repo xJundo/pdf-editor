@@ -23,6 +23,15 @@ import {
 } from "lucide-react"
 
 import { formatBytes, formatDate } from "@/components/documents/types"
+import {
+  AlertDialog,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -255,6 +264,7 @@ export function PdfEditor({
   const [exporting, setExporting] = useState(false)
   const [zoom, setZoom] = useState(1)
   const [fontsReady, setFontsReady] = useState(structure.fonts.length === 0)
+  const [versionList, setVersionList] = useState(versions)
 
   function imageSrc(xref: number) {
     return `/api/documents/${documentId}/versions/${versionId}/images/${xref}`
@@ -620,7 +630,19 @@ export function PdfEditor({
             documentId={documentId}
             currentVersionId={versionId}
             documentName={documentName}
-            versions={versions}
+            versions={versionList}
+            onDeleted={(deletedId, remaining) => {
+              setVersionList(remaining)
+              if (deletedId === versionId) {
+                const next = [...remaining].sort(
+                  (a, b) => b.versionNumber - a.versionNumber
+                )[0]
+                if (next) {
+                  router.push(`/documents/${documentId}/versions/${next.id}`)
+                  router.refresh()
+                }
+              }
+            }}
           />
           {editCount > 0 ? (
             <span className="text-sm text-muted-foreground">
@@ -1444,12 +1466,45 @@ function VersionsDialog({
   currentVersionId,
   documentName,
   versions,
+  onDeleted,
 }: {
   documentId: string
   currentVersionId: string
   documentName: string
   versions: VersionSummary[]
+  onDeleted: (deletedId: string, remaining: VersionSummary[]) => void
 }) {
+  const [deleteTarget, setDeleteTarget] = useState<VersionSummary | null>(null)
+  const [deleting, setDeleting] = useState(false)
+
+  async function handleDelete() {
+    if (!deleteTarget) return
+    setDeleting(true)
+    try {
+      const response = await fetch(
+        `/api/documents/${documentId}/versions/${deleteTarget.id}`,
+        { method: "DELETE" }
+      )
+      if (!response.ok) {
+        const data = await response.json().catch(() => null)
+        toast.add({
+          type: "error",
+          title: "Suppression impossible",
+          description: data?.error,
+        })
+        return
+      }
+      toast.add({ type: "success", title: "Version supprimée" })
+      onDeleted(
+        deleteTarget.id,
+        versions.filter((v) => v.id !== deleteTarget.id)
+      )
+      setDeleteTarget(null)
+    } finally {
+      setDeleting(false)
+    }
+  }
+
   return (
     <Dialog>
       <DialogTrigger render={<Button variant="outline" size="sm" />}>
@@ -1515,12 +1570,52 @@ function VersionsDialog({
                     <DownloadIcon data-icon="inline-start" aria-hidden="true" />
                     Télécharger
                   </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label="Supprimer la version"
+                    disabled={versions.length <= 1}
+                    onClick={() => setDeleteTarget(version)}
+                  >
+                    <Trash2Icon aria-hidden="true" />
+                  </Button>
                 </div>
               </div>
             )
           })}
         </div>
       </DialogContent>
+
+      <AlertDialog
+        open={deleteTarget !== null}
+        onOpenChange={(open) => {
+          if (!open && !deleting) setDeleteTarget(null)
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              Supprimer{" "}
+              {deleteTarget?.versionNumber === 0
+                ? "l'original"
+                : `la version ${deleteTarget?.versionNumber}`}{" "}
+              ?
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {deleteTarget?.id === currentVersionId
+                ? "C'est la version actuellement ouverte : l'éditeur basculera sur la version la plus récente restante."
+                : "Cette version sera définitivement supprimée."}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleting}>Annuler</AlertDialogCancel>
+            <Button variant="destructive" disabled={deleting} onClick={handleDelete}>
+              {deleting ? <Spinner data-icon="inline-start" /> : null}
+              Supprimer
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </Dialog>
   )
 }
