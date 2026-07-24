@@ -1,5 +1,11 @@
 FROM python:3.13-slim
 
+# Free fonts used as fallbacks when an embedded font lacks glyphs
+# (Liberation is metrically compatible with Helvetica/Times/Courier).
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends fonts-liberation fonts-noto-core fonts-dejavu-core \
+  && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /srv
 
 # uid 1001 must match the app image's user: both containers share the
