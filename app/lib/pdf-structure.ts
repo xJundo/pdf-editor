@@ -14,6 +14,22 @@ export interface PdfSpan {
   color: string
   bold: boolean
   italic: boolean
+  /** xref of the embedded font to preview via @font-face, or null. */
+  fontFile: number | null
+}
+
+/** An embedded font offered to the editor preview as @font-face. */
+export interface PdfFont {
+  xref: number
+  format: "truetype" | "opentype"
+}
+
+/** Sub-region of a source image kept on export, as fractions in 0..1. */
+export interface Crop {
+  left: number
+  top: number
+  right: number
+  bottom: number
 }
 
 /** Entries of the edit journal replayed by the pdf-service on export. */
@@ -29,6 +45,8 @@ export interface TextEditOperation {
   color: string
   bold: boolean
   italic: boolean
+  /** True when the box was manually resized (bounds shrink-to-fit strictly). */
+  boxResized?: boolean
 }
 
 export interface DeleteImageOperation {
@@ -47,10 +65,24 @@ export interface ReplaceImageOperation {
   imageBase64: string
 }
 
+export interface PlaceImageOperation {
+  type: "place_image"
+  pageNumber: number
+  imageId: string
+  xref: number
+  /** New placement rect in PDF points, top-left origin. */
+  rect: BBox
+  /** Source sub-region kept, fractions [left, top, right, bottom]. */
+  crop: [number, number, number, number] | null
+  /** Replacement PNG/JPEG base64; null reuses the original image. */
+  imageBase64: string | null
+}
+
 export type EditOperation =
   | TextEditOperation
   | DeleteImageOperation
   | ReplaceImageOperation
+  | PlaceImageOperation
 
 export function buildDeleteImageOperation(
   pageNumber: number,
@@ -73,23 +105,52 @@ export function buildReplaceImageOperation(
   }
 }
 
+/** Optional geometry override when the span box was manually resized. */
+export interface SpanBox {
+  bbox: BBox
+  origin: [number, number]
+  size: number
+}
+
 export function buildTextEditOperation(
   pageNumber: number,
   span: PdfSpan,
-  newText: string
+  newText: string,
+  box?: SpanBox
 ): TextEditOperation {
   return {
     type: "edit_text",
     pageNumber,
     spanId: span.id,
-    bbox: span.bbox,
-    origin: span.origin,
+    bbox: box?.bbox ?? span.bbox,
+    origin: box?.origin ?? span.origin,
     newText,
     font: span.font,
-    size: span.size,
+    size: box?.size ?? span.size,
     color: span.color,
     bold: span.bold,
     italic: span.italic,
+    boxResized: box !== undefined,
+  }
+}
+
+export function buildPlaceImageOperation(
+  pageNumber: number,
+  image: PdfImage,
+  rect: BBox,
+  crop: Crop | null,
+  imageBase64: string | null
+): PlaceImageOperation {
+  return {
+    type: "place_image",
+    pageNumber,
+    imageId: image.id,
+    xref: image.xref,
+    rect,
+    crop: crop
+      ? [crop.left, crop.top, crop.right, crop.bottom]
+      : null,
+    imageBase64,
   }
 }
 
@@ -110,4 +171,5 @@ export interface PdfPageStructure {
 export interface PdfStructure {
   pageCount: number
   pages: PdfPageStructure[]
+  fonts: PdfFont[]
 }

@@ -43,6 +43,25 @@ function isValidOperation(op: unknown): op is EditOperation {
   ) {
     return true
   }
+  if (
+    candidate.type === "place_image" &&
+    typeof candidate.pageNumber === "number" &&
+    typeof candidate.imageId === "string" &&
+    typeof candidate.xref === "number" &&
+    Array.isArray(candidate.rect) &&
+    candidate.rect.length === 4 &&
+    candidate.rect.every((n) => typeof n === "number") &&
+    (candidate.crop === null ||
+      (Array.isArray(candidate.crop) &&
+        candidate.crop.length === 4 &&
+        candidate.crop.every((n) => typeof n === "number"))) &&
+    (candidate.imageBase64 === null ||
+      (typeof candidate.imageBase64 === "string" &&
+        candidate.imageBase64.length > 0 &&
+        candidate.imageBase64.length <= MAX_IMAGE_BASE64_LENGTH))
+  ) {
+    return true
+  }
   return (
     candidate.type === "replace_image" &&
     typeof candidate.pageNumber === "number" &&

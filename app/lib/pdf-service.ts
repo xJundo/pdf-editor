@@ -40,6 +40,38 @@ export async function getPdfStructure(
   return callPdfService("/documents/structure", relativePath)
 }
 
+/** Fetches a single embedded image (as PNG) from the pdf-service. */
+export async function fetchPdfImage(
+  relativePath: string,
+  xref: number
+): Promise<Response> {
+  const url = new URL("/documents/image", PDF_SERVICE_URL)
+  url.searchParams.set("path", relativePath)
+  url.searchParams.set("xref", String(xref))
+  const response = await fetch(url, { cache: "no-store" })
+  if (!response.ok) {
+    const body = await response.text().catch(() => "")
+    throw new PdfServiceError(`pdf-service: ${response.status} ${body}`, response.status)
+  }
+  return response
+}
+
+/** Fetches an embedded font program (ttf/otf) from the pdf-service. */
+export async function fetchPdfFont(
+  relativePath: string,
+  xref: number
+): Promise<Response> {
+  const url = new URL("/documents/font", PDF_SERVICE_URL)
+  url.searchParams.set("path", relativePath)
+  url.searchParams.set("xref", String(xref))
+  const response = await fetch(url, { cache: "no-store" })
+  if (!response.ok) {
+    const body = await response.text().catch(() => "")
+    throw new PdfServiceError(`pdf-service: ${response.status} ${body}`, response.status)
+  }
+  return response
+}
+
 export interface ExportResult {
   pageCount: number
   deletedSignatureFields: number

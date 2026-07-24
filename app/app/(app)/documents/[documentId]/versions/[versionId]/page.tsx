@@ -2,7 +2,7 @@ import { notFound } from "next/navigation"
 
 import { PdfEditor } from "@/components/editor/pdf-editor"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
-import { getOwnedVersion } from "@/lib/documents"
+import { getDocumentVersions, getOwnedVersion } from "@/lib/documents"
 import { getPdfStructure } from "@/lib/pdf-service"
 import type { PdfStructure } from "@/lib/pdf-structure"
 import { requireSession } from "@/lib/session"
@@ -19,6 +19,8 @@ export default async function EditorPage({
   if (!version) {
     notFound()
   }
+
+  const versions = await getDocumentVersions(session.user.id, documentId)
 
   let structure: PdfStructure
   try {
@@ -43,6 +45,13 @@ export default async function EditorPage({
       structure={structure}
       documentName={version.name}
       versionNumber={version.versionNumber}
+      versions={versions.map((v) => ({
+        id: v.id,
+        versionNumber: v.versionNumber,
+        fileSize: Number(v.fileSize),
+        pageCount: v.pageCount,
+        createdAt: v.createdAt.toISOString(),
+      }))}
     />
   )
 }

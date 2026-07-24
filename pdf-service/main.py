@@ -8,13 +8,15 @@ to FILES_ROOT, never raw file contents.
 import base64
 import binascii
 import functools
+import io
 import os
 from collections import defaultdict
 from pathlib import Path
 from typing import Annotated, Literal
 
 import pymupdf
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
+from fontTools.ttLib import TTFont
 from pydantic import BaseModel, Field
 
 FILES_ROOT = Path(os.environ.get("FILES_ROOT", "/data/files")).resolve()
@@ -75,6 +77,67 @@ def _color_to_hex(color: int) -> str:
     return f"#{color:06x}"
 
 
+def _font_has_unicode_cmap(buffer: bytes) -> bool:
+    """True if a font program exposes a real unicode cmap (safe for CSS @font-face).
+
+    Identity-H subsets without a unicode cmap would render as tofu in the
+    browser, so those are excluded and the front falls back to a look-alike.
+    """
+    try:
+        tt = TTFont(io.BytesIO(buffer), fontNumber=0, lazy=True)
+    except Exception:
+        return False
+    try:
+        if "cmap" not in tt:
+            return False
+        return any(table.isUnicode() and table.cmap for table in tt["cmap"].tables)
+    finally:
+        tt.close()
+
+
+def page_preview_fonts(
+    doc: pymupdf.Document, page: pymupdf.Page
+) -> dict[str, tuple[int, str]]:
+    """Map normalized embedded font names to (xref, css-format) for the preview.
+
+    Only ttf/otf programs carrying a unicode cmap are offered — those the
+    browser can load via @font-face and map text to correctly.
+    """
+    result: dict[str, tuple[int, str]] = {}
+    for entry in page.get_fonts(full=True):
+        xref, ext, basefont = entry[0], entry[1], entry[3]
+        if ext not in ("ttf", "otf"):
+            continue
+        try:
+            _name, _ext, _type, buffer = doc.extract_font(xref)
+        except Exception:
+            continue
+        if not buffer or not _font_has_unicode_cmap(buffer):
+            continue
+        result[_normalize_font_name(basefont)] = (
+            xref,
+            "truetype" if ext == "ttf" else "opentype",
+        )
+    return result
+
+
+@app.get("/documents/font")
+def document_font(path: str, xref: int) -> Response:
+    """Return an embedded font program (ttf/otf) for the editor's @font-face."""
+    file = resolve_file(path)
+    with pymupdf.open(file) as doc:
+        if not 0 < xref < doc.xref_length():
+            raise HTTPException(status_code=404, detail="font not found")
+        try:
+            _name, ext, _type, buffer = doc.extract_font(xref)
+        except Exception as exc:
+            raise HTTPException(status_code=404, detail="font not found") from exc
+        if not buffer or ext not in ("ttf", "otf"):
+            raise HTTPException(status_code=404, detail="font not extractable")
+        media = "font/ttf" if ext == "ttf" else "font/otf"
+        return Response(content=buffer, media_type=media)
+
+
 @app.get("/documents/structure")
 def document_structure(path: str) -> dict:
     """Extract the editable structure of a PDF.
@@ -92,8 +155,23 @@ def document_structure(path: str) -> dict:
             if not doc.is_pdf:
                 raise HTTPException(status_code=422, detail="not a PDF")
             pages = []
+            preview_fonts: dict[int, str] = {}  # xref -> css format, doc-wide
             for page_index, page in enumerate(doc):
                 spans = []
+                # Embedded fonts of this page usable as @font-face previews.
+                page_fonts = page_preview_fonts(doc, page)
+                for xref, fmt in page_fonts.values():
+                    preview_fonts[xref] = fmt
+
+                def match_preview_font(font_name: str) -> int | None:
+                    target = _normalize_font_name(font_name)
+                    if target in page_fonts:
+                        return page_fonts[target][0]
+                    for name, (xref, _fmt) in page_fonts.items():
+                        if name.startswith(target) or target.startswith(name):
+                            return xref
+                    return None
+
                 text = page.get_text("dict")
                 for block_index, block in enumerate(text["blocks"]):
                     if block["type"] != 0:
@@ -116,6 +194,8 @@ def document_structure(path: str) -> dict:
                                     "color": _color_to_hex(span["color"]),
                                     "bold": bool(span["flags"] & _FLAG_BOLD),
                                     "italic": bool(span["flags"] & _FLAG_ITALIC),
+                                    # xref of the embedded font to preview, if any.
+                                    "fontFile": match_preview_font(span["font"]),
                                 }
                             )
                 images = []
@@ -144,9 +224,34 @@ def document_structure(path: str) -> dict:
                         "images": images,
                     }
                 )
-            return {"pageCount": doc.page_count, "pages": pages}
+            fonts = [
+                {"xref": xref, "format": fmt} for xref, fmt in preview_fonts.items()
+            ]
+            return {"pageCount": doc.page_count, "pages": pages, "fonts": fonts}
     except pymupdf.FileDataError as exc:
         raise HTTPException(status_code=422, detail=f"cannot open PDF: {exc}") from exc
+
+
+@app.get("/documents/image")
+def document_image(path: str, xref: int) -> Response:
+    """Return a single embedded image (by xref) as PNG, for the editor preview.
+
+    Always re-encoded to PNG (composing any soft mask) so the browser can
+    render it regardless of the original in-PDF colorspace/format.
+    """
+    file = resolve_file(path)
+    with pymupdf.open(file) as doc:
+        if not doc.is_pdf:
+            raise HTTPException(status_code=422, detail="not a PDF")
+        if not 0 < xref < doc.xref_length():
+            raise HTTPException(status_code=404, detail="image not found")
+        try:
+            pix = pymupdf.Pixmap(doc, xref)
+        except Exception as exc:  # xref is not an image
+            raise HTTPException(status_code=404, detail="image not found") from exc
+        if pix.colorspace is not None and pix.colorspace.n > 3:
+            pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
+        return Response(content=pix.tobytes("png"), media_type="image/png")
 
 
 class TextEditOperation(BaseModel):
@@ -161,6 +266,10 @@ class TextEditOperation(BaseModel):
     color: str
     bold: bool
     italic: bool
+    # True when the user manually resized the text box: the size is then taken
+    # as chosen and shrink-to-fit is bounded by the box width alone (no page
+    # right-margin expansion — that auto-growth is only for in-place edits).
+    boxResized: bool = False
 
 
 class DeleteImageOperation(BaseModel):
@@ -180,8 +289,27 @@ class ReplaceImageOperation(BaseModel):
     imageBase64: str
 
 
+class PlaceImageOperation(BaseModel):
+    type: Literal["place_image"]
+    pageNumber: int
+    imageId: str
+    xref: int
+    # New placement rectangle in PDF points, top-left origin (same convention
+    # as extraction). The image (original or replacement) is drawn stretched
+    # into this rect, replacing its former placement.
+    rect: tuple[float, float, float, float]
+    # Sub-region of the source image to keep, as fractions [left, top, right,
+    # bottom] in 0..1. None keeps the whole image.
+    crop: tuple[float, float, float, float] | None = None
+    # Replacement bytes (PNG/JPEG base64); None reuses the original image.
+    imageBase64: str | None = None
+
+
 Operation = Annotated[
-    TextEditOperation | DeleteImageOperation | ReplaceImageOperation,
+    TextEditOperation
+    | DeleteImageOperation
+    | ReplaceImageOperation
+    | PlaceImageOperation,
     Field(discriminator="type"),
 ]
 
@@ -337,14 +465,19 @@ def fitted_fontsize(
 ) -> float:
     """Shrink the font size just enough for the new text to fit its line.
 
-    The text may grow past the original span bbox up to the page right
-    margin; beyond that the size is reduced (never below MIN_FITTED_FONTSIZE).
+    For in-place edits the text may grow past the original span bbox up to the
+    page right margin; beyond that the size is reduced (never below
+    MIN_FITTED_FONTSIZE). When the box was manually resized, only its own width
+    bounds the text — the user's box wins over the auto-growth heuristic.
     """
-    origin_x = operation.origin[0]
-    available = max(
-        operation.bbox[2] - operation.bbox[0],
-        page.rect.x1 - _PAGE_RIGHT_MARGIN - origin_x,
-    )
+    box_width = operation.bbox[2] - operation.bbox[0]
+    if operation.boxResized:
+        available = box_width
+    else:
+        available = max(
+            box_width,
+            page.rect.x1 - _PAGE_RIGHT_MARGIN - operation.origin[0],
+        )
     if available <= 0:
         return operation.size
     width = font.text_length(operation.newText, fontsize=operation.size)
@@ -358,6 +491,66 @@ def hex_to_rgb(color: str) -> tuple[float, float, float]:
     if len(value) != 6:
         return (0.0, 0.0, 0.0)
     return tuple(int(value[i : i + 2], 16) / 255 for i in (0, 2, 4))
+
+
+def _decode_image_bytes(data: bytes) -> pymupdf.Pixmap:
+    """Decode replacement/source bytes to an RGB(A) pixmap for cropping."""
+    try:
+        pix = pymupdf.Pixmap(data)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail="unsupported image format") from exc
+    # CMYK (or other >3 component) spaces can't be re-encoded to PNG directly.
+    if pix.colorspace is not None and pix.colorspace.n > 3:
+        pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
+    return pix
+
+
+def _cropped_pixmap(pix: pymupdf.Pixmap, crop: tuple[float, float, float, float]) -> pymupdf.Pixmap:
+    """Keep the [left, top, right, bottom] fractional sub-region of a pixmap."""
+    left, top, right, bottom = crop
+    x0 = max(0, min(pix.width, round(left * pix.width)))
+    y0 = max(0, min(pix.height, round(top * pix.height)))
+    x1 = max(x0 + 1, min(pix.width, round(right * pix.width)))
+    y1 = max(y0 + 1, min(pix.height, round(bottom * pix.height)))
+    clip = pymupdf.IRect(x0, y0, x1, y1)
+    cropped = pymupdf.Pixmap(pix.colorspace, clip, pix.alpha)
+    cropped.copy(pix, clip)
+    return cropped
+
+
+def _place_image(
+    doc: pymupdf.Document, page: pymupdf.Page, operation: "PlaceImageOperation"
+) -> None:
+    """Redraw an image (original or replacement) into a new rect, cropped."""
+    rect = pymupdf.Rect(*operation.rect)
+    if rect.is_empty or not rect.is_valid:
+        raise HTTPException(status_code=422, detail="invalid image placement rect")
+
+    if operation.imageBase64 is not None:
+        try:
+            data = base64.b64decode(operation.imageBase64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="invalid image encoding") from exc
+        if len(data) > MAX_IMAGE_BYTES:
+            raise HTTPException(status_code=422, detail="image too large")
+    else:
+        extracted = doc.extract_image(operation.xref)
+        data = extracted.get("image") if extracted else None
+        if not data:
+            raise HTTPException(
+                status_code=422, detail=f"cannot extract image {operation.xref}"
+            )
+
+    # Remove the former placement before drawing the new one.
+    page.delete_image(operation.xref)
+
+    if operation.crop is not None and operation.crop != (0.0, 0.0, 1.0, 1.0):
+        pix = _cropped_pixmap(_decode_image_bytes(data), operation.crop)
+        page.insert_image(rect, pixmap=pix, keep_proportion=False)
+    else:
+        # Validate decodability even when not cropping.
+        _decode_image_bytes(data)
+        page.insert_image(rect, stream=data, keep_proportion=False)
 
 
 def delete_signature_fields(doc: pymupdf.Document) -> int:
@@ -396,9 +589,10 @@ def export_document(request: ExportRequest) -> dict:
             raise HTTPException(status_code=422, detail="not a PDF")
 
         text_ops: dict[int, list[TextEditOperation]] = defaultdict(list)
-        image_ops: dict[int, list[DeleteImageOperation | ReplaceImageOperation]] = (
-            defaultdict(list)
-        )
+        image_ops: dict[
+            int,
+            list[DeleteImageOperation | ReplaceImageOperation | PlaceImageOperation],
+        ] = defaultdict(list)
         for operation in request.operations:
             if not 0 <= operation.pageNumber < doc.page_count:
                 raise HTTPException(
@@ -460,6 +654,8 @@ def export_document(request: ExportRequest) -> dict:
                     )
                 if isinstance(operation, DeleteImageOperation):
                     page.delete_image(operation.xref)
+                elif isinstance(operation, PlaceImageOperation):
+                    _place_image(doc, page, operation)
                 else:
                     try:
                         data = base64.b64decode(operation.imageBase64, validate=True)

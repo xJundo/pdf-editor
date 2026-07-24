@@ -6,15 +6,23 @@ import { useRouter } from "next/navigation"
 import type { PDFDocumentProxy } from "pdfjs-dist"
 import {
   ArrowLeftIcon,
+  CropIcon,
+  DownloadIcon,
+  HistoryIcon,
   ImageIcon,
   ImageOffIcon,
   ImageUpIcon,
+  MoveIcon,
+  PencilIcon,
   RotateCcwIcon,
   SaveIcon,
   Trash2Icon,
   TypeIcon,
+  ZoomInIcon,
+  ZoomOutIcon,
 } from "lucide-react"
 
+import { formatBytes, formatDate } from "@/components/documents/types"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -24,27 +32,55 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog"
 import { Separator } from "@/components/ui/separator"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
 import { toast } from "@/components/ui/toast"
 import { cn } from "@/lib/utils"
 import type {
+  BBox,
+  Crop,
   EditOperation,
   PdfImage,
   PdfPageStructure,
   PdfSpan,
   PdfStructure,
+  SpanBox,
 } from "@/lib/pdf-structure"
 import {
   buildDeleteImageOperation,
-  buildReplaceImageOperation,
+  buildPlaceImageOperation,
   buildTextEditOperation,
 } from "@/lib/pdf-structure"
 
-export type ImageEdit = { type: "delete" } | { type: "replace"; dataUrl: string }
+/** delete = removed; transform = moved/resized/cropped, optionally replaced. */
+export type ImageEdit =
+  | { type: "delete" }
+  | { type: "transform"; bbox: BBox; crop: Crop | null; dataUrl: string | null }
 
 const MAX_REPLACEMENT_IMAGE_BYTES = 15 * 1024 * 1024
+const MIN_BOX_PT = 8
+
+const BASE_PAGE_WIDTH = 768 // px at zoom = 1 (matches the former max-w-3xl)
+const ZOOM_MIN = 0.5
+const ZOOM_MAX = 3
+const ZOOM_STEP = 0.25
+
+export interface VersionSummary {
+  id: string
+  versionNumber: number
+  fileSize: number
+  pageCount: number | null
+  createdAt: string
+}
 
 interface Selection {
   pageIndex: number
@@ -74,6 +110,122 @@ function displayFontName(font: string) {
   return plus === 6 ? font.slice(7) : font
 }
 
+/** Real embedded font (via @font-face) when available, heuristic fallback otherwise. */
+function spanFontFamily(span: PdfSpan): string {
+  const fallback = cssFontFamily(span.font)
+  return span.fontFile != null ? `"pdffont-${span.fontFile}", ${fallback}` : fallback
+}
+
+// --- Geometry helpers (PDF points, top-left origin) ----------------------
+
+const RESIZE_HANDLES = [
+  { id: "nw", x: 0, y: 0, cursor: "nwse-resize" },
+  { id: "n", x: 0.5, y: 0, cursor: "ns-resize" },
+  { id: "ne", x: 1, y: 0, cursor: "nesw-resize" },
+  { id: "e", x: 1, y: 0.5, cursor: "ew-resize" },
+  { id: "se", x: 1, y: 1, cursor: "nwse-resize" },
+  { id: "s", x: 0.5, y: 1, cursor: "ns-resize" },
+  { id: "sw", x: 0, y: 1, cursor: "nesw-resize" },
+  { id: "w", x: 0, y: 0.5, cursor: "ew-resize" },
+] as const
+
+function bboxToPercent(bbox: BBox, pageWidth: number, pageHeight: number) {
+  return {
+    left: `${(bbox[0] / pageWidth) * 100}%`,
+    top: `${(bbox[1] / pageHeight) * 100}%`,
+    width: `${((bbox[2] - bbox[0]) / pageWidth) * 100}%`,
+    height: `${((bbox[3] - bbox[1]) / pageHeight) * 100}%`,
+  }
+}
+
+/** Tracks a pointer drag inside the page wrapper, reporting PDF-point deltas. */
+function beginPointerDrag(
+  event: React.PointerEvent,
+  pageWidth: number,
+  pageHeight: number,
+  onMove: (dx: number, dy: number) => void
+) {
+  const wrapper = (event.currentTarget as HTMLElement).closest(
+    "[data-page]"
+  ) as HTMLElement | null
+  if (!wrapper) return
+  event.preventDefault()
+  event.stopPropagation()
+  const rect = wrapper.getBoundingClientRect()
+  const toPdf = (cx: number, cy: number): [number, number] => [
+    ((cx - rect.left) / rect.width) * pageWidth,
+    ((cy - rect.top) / rect.height) * pageHeight,
+  ]
+  const [sx, sy] = toPdf(event.clientX, event.clientY)
+  const move = (ev: PointerEvent) => {
+    const [x, y] = toPdf(ev.clientX, ev.clientY)
+    onMove(x - sx, y - sy)
+  }
+  const up = () => {
+    window.removeEventListener("pointermove", move)
+    window.removeEventListener("pointerup", up)
+  }
+  window.addEventListener("pointermove", move)
+  window.addEventListener("pointerup", up)
+}
+
+function moveBbox(b: BBox, dx: number, dy: number, pw: number, ph: number): BBox {
+  const w = b[2] - b[0]
+  const h = b[3] - b[1]
+  const x0 = Math.max(0, Math.min(pw - w, b[0] + dx))
+  const y0 = Math.max(0, Math.min(ph - h, b[1] + dy))
+  return [x0, y0, x0 + w, y0 + h]
+}
+
+function resizeBbox(
+  b: BBox,
+  handle: string,
+  dx: number,
+  dy: number,
+  pw: number,
+  ph: number
+): BBox {
+  let [x0, y0, x1, y1] = b
+  if (handle.includes("w")) x0 = Math.max(0, Math.min(x1 - MIN_BOX_PT, x0 + dx))
+  if (handle.includes("e")) x1 = Math.min(pw, Math.max(x0 + MIN_BOX_PT, x1 + dx))
+  if (handle.includes("n")) y0 = Math.max(0, Math.min(y1 - MIN_BOX_PT, y0 + dy))
+  if (handle.includes("s")) y1 = Math.min(ph, Math.max(y0 + MIN_BOX_PT, y1 + dy))
+  return [x0, y0, x1, y1]
+}
+
+function resizeCrop(c: Crop, handle: string, dfx: number, dfy: number): Crop {
+  const MIN = 0.05
+  const next = { ...c }
+  if (handle.includes("w")) next.left = Math.max(0, Math.min(next.right - MIN, c.left + dfx))
+  if (handle.includes("e"))
+    next.right = Math.min(1, Math.max(next.left + MIN, c.right + dfx))
+  if (handle.includes("n")) next.top = Math.max(0, Math.min(next.bottom - MIN, c.top + dfy))
+  if (handle.includes("s"))
+    next.bottom = Math.min(1, Math.max(next.top + MIN, c.bottom + dfy))
+  return next
+}
+
+/** Background style showing the kept crop region stretched to fill the box. */
+function cropFillStyle(src: string, crop: Crop | null): React.CSSProperties {
+  if (!crop) {
+    return {
+      backgroundImage: `url(${src})`,
+      backgroundSize: "100% 100%",
+      backgroundRepeat: "no-repeat",
+    }
+  }
+  const w = crop.right - crop.left
+  const h = crop.bottom - crop.top
+  const posX = w >= 1 ? 0 : (crop.left / (1 - w)) * 100
+  const posY = h >= 1 ? 0 : (crop.top / (1 - h)) * 100
+  return {
+    backgroundImage: `url(${src})`,
+    backgroundRepeat: "no-repeat",
+    backgroundSize: `${100 / w}% ${100 / h}%`,
+    backgroundPosition: `${posX}% ${posY}%`,
+  }
+}
+
 export function PdfEditor({
   documentId,
   versionId,
@@ -81,6 +233,7 @@ export function PdfEditor({
   structure,
   documentName,
   versionNumber,
+  versions,
 }: {
   documentId: string
   versionId: string
@@ -88,15 +241,57 @@ export function PdfEditor({
   structure: PdfStructure
   documentName: string
   versionNumber: number
+  versions: VersionSummary[]
 }) {
   const router = useRouter()
   const [pdfDoc, setPdfDoc] = useState<PDFDocumentProxy | null>(null)
   const [loadError, setLoadError] = useState(false)
   const [selection, setSelection] = useState<Selection | null>(null)
   const [edits, setEdits] = useState<Record<string, string>>({})
+  const [spanBoxes, setSpanBoxes] = useState<Record<string, SpanBox>>({})
   const [imageEdits, setImageEdits] = useState<Record<string, ImageEdit>>({})
   const [editingId, setEditingId] = useState<string | null>(null)
+  const [croppingId, setCroppingId] = useState<string | null>(null)
   const [exporting, setExporting] = useState(false)
+  const [zoom, setZoom] = useState(1)
+  const [fontsReady, setFontsReady] = useState(structure.fonts.length === 0)
+
+  function imageSrc(xref: number) {
+    return `/api/documents/${documentId}/versions/${versionId}/images/${xref}`
+  }
+
+  // Expose the PDF's own embedded fonts to the preview via @font-face.
+  const fontFaceCss = useMemo(
+    () =>
+      structure.fonts
+        .map(
+          (f) =>
+            `@font-face{font-family:"pdffont-${f.xref}";` +
+            `src:url("/api/documents/${documentId}/versions/${versionId}/fonts/${f.xref}") ` +
+            `format("${f.format}");font-display:swap;}`
+        )
+        .join("\n"),
+    [structure.fonts, documentId, versionId]
+  )
+
+  // "Identification des polices…" until the embedded fonts have loaded
+  // (initial state already handles the no-embedded-fonts case).
+  useEffect(() => {
+    if (structure.fonts.length === 0) return
+    let cancelled = false
+    const families = structure.fonts.map((f) => `16px "pdffont-${f.xref}"`)
+    Promise.race([
+      Promise.all(families.map((f) => document.fonts.load(f))).then(() =>
+        document.fonts.ready
+      ),
+      new Promise((resolve) => setTimeout(resolve, 6000)),
+    ]).finally(() => {
+      if (!cancelled) setFontsReady(true)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [structure.fonts])
 
   useEffect(() => {
     let cancelled = false
@@ -159,19 +354,11 @@ export function PdfEditor({
     return image ? { type: "image" as const, image } : null
   }, [selection, structure])
 
-  const editCount = Object.keys(edits).length + Object.keys(imageEdits).length
-
-  function setImageEdit(imageId: string, edit: ImageEdit) {
-    setImageEdits((current) => ({ ...current, [imageId]: edit }))
-  }
-
-  function revertImageEdit(imageId: string) {
-    setImageEdits((current) => {
-      const next = { ...current }
-      delete next[imageId]
-      return next
-    })
-  }
+  const modifiedSpanIds = useMemo(
+    () => new Set([...Object.keys(edits), ...Object.keys(spanBoxes)]),
+    [edits, spanBoxes]
+  )
+  const editCount = modifiedSpanIds.size + Object.keys(imageEdits).length
 
   function replaceImage(imageId: string, file: File) {
     if (!["image/png", "image/jpeg"].includes(file.type)) {
@@ -183,20 +370,75 @@ export function PdfEditor({
       return
     }
     if (file.size > MAX_REPLACEMENT_IMAGE_BYTES) {
-      toast.add({
-        type: "error",
-        title: "Image trop volumineuse",
-        description: "15 Mo maximum.",
-      })
+      toast.add({ type: "error", title: "Image trop volumineuse", description: "15 Mo maximum." })
       return
     }
+    const entry = imageIndex.get(imageId)
+    if (!entry) return
     const reader = new FileReader()
     reader.onload = () => {
-      if (typeof reader.result === "string") {
-        setImageEdit(imageId, { type: "replace", dataUrl: reader.result })
-      }
+      if (typeof reader.result !== "string") return
+      setImageEdits((current) => {
+        const prev = current[imageId]
+        const base: BBox =
+          prev && prev.type === "transform" ? prev.bbox : entry.image.bbox
+        const crop = prev && prev.type === "transform" ? prev.crop : null
+        return {
+          ...current,
+          [imageId]: { type: "transform", bbox: base, crop, dataUrl: reader.result as string },
+        }
+      })
     }
     reader.readAsDataURL(file)
+  }
+
+  function transformImage(imageId: string, bbox: BBox) {
+    const entry = imageIndex.get(imageId)
+    if (!entry) return
+    setImageEdits((current) => {
+      const prev = current[imageId]
+      const crop = prev && prev.type === "transform" ? prev.crop : null
+      const dataUrl = prev && prev.type === "transform" ? prev.dataUrl : null
+      return { ...current, [imageId]: { type: "transform", bbox, crop, dataUrl } }
+    })
+  }
+
+  function cropImage(imageId: string, crop: Crop) {
+    const entry = imageIndex.get(imageId)
+    if (!entry) return
+    setImageEdits((current) => {
+      const prev = current[imageId]
+      const bbox = prev && prev.type === "transform" ? prev.bbox : entry.image.bbox
+      const dataUrl = prev && prev.type === "transform" ? prev.dataUrl : null
+      return { ...current, [imageId]: { type: "transform", bbox, crop, dataUrl } }
+    })
+  }
+
+  function ensureTransform(imageId: string) {
+    const entry = imageIndex.get(imageId)
+    if (!entry) return
+    setImageEdits((current) => {
+      const prev = current[imageId]
+      if (prev && prev.type === "transform") return current
+      return {
+        ...current,
+        [imageId]: { type: "transform", bbox: entry.image.bbox, crop: null, dataUrl: null },
+      }
+    })
+  }
+
+  function deleteImage(imageId: string) {
+    setImageEdits((current) => ({ ...current, [imageId]: { type: "delete" } }))
+    if (croppingId === imageId) setCroppingId(null)
+  }
+
+  function revertImageEdit(imageId: string) {
+    setImageEdits((current) => {
+      const next = { ...current }
+      delete next[imageId]
+      return next
+    })
+    if (croppingId === imageId) setCroppingId(null)
   }
 
   function commitEdit(span: PdfSpan, draft: string) {
@@ -212,8 +454,25 @@ export function PdfEditor({
     setEditingId(null)
   }
 
-  function revertEdit(spanId: string) {
+  function resizeSpanBox(span: PdfSpan, bbox: BBox) {
+    const ow = span.bbox[2] - span.bbox[0]
+    const oh = span.bbox[3] - span.bbox[1]
+    const nw = bbox[2] - bbox[0]
+    const nh = bbox[3] - bbox[1]
+    const ratioX = ow > 0 ? (span.origin[0] - span.bbox[0]) / ow : 0
+    const ratioY = oh > 0 ? (span.origin[1] - span.bbox[1]) / oh : 1
+    const size = oh > 0 ? span.size * (nh / oh) : span.size
+    const origin: [number, number] = [bbox[0] + ratioX * nw, bbox[1] + ratioY * nh]
+    setSpanBoxes((current) => ({ ...current, [span.id]: { bbox, origin, size } }))
+  }
+
+  function revertSpan(spanId: string) {
     setEdits((current) => {
+      const next = { ...current }
+      delete next[spanId]
+      return next
+    })
+    setSpanBoxes((current) => {
       const next = { ...current }
       delete next[spanId]
       return next
@@ -221,29 +480,49 @@ export function PdfEditor({
     if (editingId === spanId) setEditingId(null)
   }
 
+  function goToElement(sel: Selection) {
+    setSelection(sel)
+    setCroppingId(null)
+    if (sel.type === "span") setEditingId(sel.id)
+    // Scroll the page into view; the element highlight guides the eye.
+    requestAnimationFrame(() => {
+      const el = document.querySelector(`[data-page="${sel.pageIndex}"]`)
+      el?.scrollIntoView({ behavior: "smooth", block: "center" })
+    })
+  }
+
   async function handleExport() {
     if (editCount === 0 || exporting) return
     setExporting(true)
     try {
-      const operations: EditOperation[] = Object.entries(edits).map(
-        ([spanId, newText]) => {
-          const entry = spanIndex.get(spanId)
-          if (!entry) throw new Error(`unknown span ${spanId}`)
-          return buildTextEditOperation(entry.page.number, entry.span, newText)
-        }
-      )
+      const operations: EditOperation[] = []
+      for (const spanId of modifiedSpanIds) {
+        const entry = spanIndex.get(spanId)
+        if (!entry) throw new Error(`unknown span ${spanId}`)
+        const newText = spanId in edits ? edits[spanId] : entry.span.text
+        operations.push(
+          buildTextEditOperation(entry.page.number, entry.span, newText, spanBoxes[spanId])
+        )
+      }
       for (const [imageId, edit] of Object.entries(imageEdits)) {
         const entry = imageIndex.get(imageId)
         if (!entry) throw new Error(`unknown image ${imageId}`)
-        operations.push(
-          edit.type === "delete"
-            ? buildDeleteImageOperation(entry.page.number, entry.image)
-            : buildReplaceImageOperation(
-                entry.page.number,
-                entry.image,
-                edit.dataUrl.slice(edit.dataUrl.indexOf(",") + 1)
-              )
-        )
+        if (edit.type === "delete") {
+          operations.push(buildDeleteImageOperation(entry.page.number, entry.image))
+        } else {
+          const base64 = edit.dataUrl
+            ? edit.dataUrl.slice(edit.dataUrl.indexOf(",") + 1)
+            : null
+          operations.push(
+            buildPlaceImageOperation(
+              entry.page.number,
+              entry.image,
+              edit.bbox,
+              edit.crop,
+              base64
+            )
+          )
+        }
       }
       const response = await fetch(`/api/documents/${documentId}/versions`, {
         method: "POST",
@@ -260,10 +539,14 @@ export function PdfEditor({
         return
       }
       const data = await response.json()
+      // Auto-download the freshly created version, then open it in the editor.
+      triggerDownload(
+        `/api/documents/${documentId}/versions/${data.versionId}/download`
+      )
       toast.add({
         type: "success",
         title: `Version ${data.versionNumber} créée`,
-        description: "La nouvelle version est ouverte dans l'éditeur.",
+        description: "Le fichier est téléchargé et ouvert dans l'éditeur.",
       })
       router.push(`/documents/${documentId}/versions/${data.versionId}`)
       router.refresh()
@@ -274,6 +557,9 @@ export function PdfEditor({
 
   return (
     <div className="flex flex-col gap-4">
+      {fontFaceCss ? (
+        <style dangerouslySetInnerHTML={{ __html: fontFaceCss }} />
+      ) : null}
       <div className="flex items-center gap-3">
         <Button
           variant="ghost"
@@ -292,7 +578,50 @@ export function PdfEditor({
         <span className="text-sm text-muted-foreground">
           {structure.pageCount} page{structure.pageCount > 1 ? "s" : ""}
         </span>
+        {!fontsReady ? (
+          <span
+            className="flex items-center gap-1.5 text-sm text-muted-foreground"
+            data-testid="fonts-loading"
+          >
+            <Spinner className="size-3.5" />
+            Identification des polices…
+          </span>
+        ) : null}
         <div className="ml-auto flex items-center gap-2">
+          <div className="flex items-center rounded-md border">
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              aria-label="Dézoomer"
+              disabled={zoom <= ZOOM_MIN}
+              onClick={() => setZoom((z) => Math.max(ZOOM_MIN, Math.round((z - ZOOM_STEP) * 100) / 100))}
+            >
+              <ZoomOutIcon aria-hidden="true" />
+            </Button>
+            <button
+              type="button"
+              className="w-12 text-center text-sm tabular-nums hover:underline"
+              onClick={() => setZoom(1)}
+              title="Réinitialiser le zoom"
+            >
+              {Math.round(zoom * 100)}%
+            </button>
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              aria-label="Zoomer"
+              disabled={zoom >= ZOOM_MAX}
+              onClick={() => setZoom((z) => Math.min(ZOOM_MAX, Math.round((z + ZOOM_STEP) * 100) / 100))}
+            >
+              <ZoomInIcon aria-hidden="true" />
+            </Button>
+          </div>
+          <VersionsDialog
+            documentId={documentId}
+            currentVersionId={versionId}
+            documentName={documentName}
+            versions={versions}
+          />
           {editCount > 0 ? (
             <span className="text-sm text-muted-foreground">
               {editCount} modification{editCount > 1 ? "s" : ""}
@@ -315,40 +644,60 @@ export function PdfEditor({
         </p>
       ) : (
         <div className="flex items-start gap-6">
-          <div className="flex min-w-0 flex-1 flex-col items-center gap-6">
-            {structure.pages.map((page) => (
-              <PdfPageView
-                key={page.number}
-                pdfDoc={pdfDoc}
-                page={page}
-                selection={selection}
-                edits={edits}
-                imageEdits={imageEdits}
-                editingId={editingId}
-                onSelect={setSelection}
-                onStartEdit={(id) => setEditingId(id)}
-                onCommitEdit={commitEdit}
-                onCancelEdit={() => setEditingId(null)}
-              />
-            ))}
+          <div className="min-w-0 flex-1 overflow-x-auto">
+            <div className="flex flex-col items-center gap-6">
+              {structure.pages.map((page) => (
+                <PdfPageView
+                  key={page.number}
+                  pdfDoc={pdfDoc}
+                  page={page}
+                  zoom={zoom}
+                  selection={selection}
+                  edits={edits}
+                  spanBoxes={spanBoxes}
+                  imageEdits={imageEdits}
+                  editingId={editingId}
+                  croppingId={croppingId}
+                  imageSrc={imageSrc}
+                  onSelect={setSelection}
+                  onStartEdit={(id) => setEditingId(id)}
+                  onCommitEdit={commitEdit}
+                  onCancelEdit={() => setEditingId(null)}
+                  onResizeSpan={resizeSpanBox}
+                  onTransformImage={transformImage}
+                  onCropImage={cropImage}
+                />
+              ))}
+            </div>
           </div>
           <aside className="sticky top-6 hidden w-72 shrink-0 flex-col gap-4 lg:flex">
             <SelectionPanel
               selected={selected}
               edits={edits}
+              spanBoxes={spanBoxes}
               imageEdits={imageEdits}
-              onRevert={revertEdit}
+              cropping={croppingId}
+              onRevert={revertSpan}
               onReplaceImage={replaceImage}
-              onDeleteImage={(imageId) => setImageEdit(imageId, { type: "delete" })}
+              onDeleteImage={deleteImage}
               onRevertImage={revertImageEdit}
+              onToggleCrop={(imageId) =>
+                setCroppingId((current) => {
+                  if (current === imageId) return null
+                  ensureTransform(imageId)
+                  return imageId
+                })
+              }
             />
             {editCount > 0 ? (
               <EditsPanel
                 edits={edits}
+                spanBoxes={spanBoxes}
                 imageEdits={imageEdits}
                 spanIndex={spanIndex}
                 imageIndex={imageIndex}
-                onRevert={revertEdit}
+                onSelect={goToElement}
+                onRevert={revertSpan}
                 onRevertImage={revertImageEdit}
               />
             ) : null}
@@ -362,25 +711,39 @@ export function PdfEditor({
 function PdfPageView({
   pdfDoc,
   page,
+  zoom,
   selection,
   edits,
+  spanBoxes,
   imageEdits,
   editingId,
+  croppingId,
+  imageSrc,
   onSelect,
   onStartEdit,
   onCommitEdit,
   onCancelEdit,
+  onResizeSpan,
+  onTransformImage,
+  onCropImage,
 }: {
   pdfDoc: PDFDocumentProxy | null
   page: PdfPageStructure
+  zoom: number
   selection: Selection | null
   edits: Record<string, string>
+  spanBoxes: Record<string, SpanBox>
   imageEdits: Record<string, ImageEdit>
   editingId: string | null
+  croppingId: string | null
+  imageSrc: (xref: number) => string
   onSelect: (selection: Selection) => void
   onStartEdit: (spanId: string) => void
   onCommitEdit: (span: PdfSpan, draft: string) => void
   onCancelEdit: () => void
+  onResizeSpan: (span: PdfSpan, bbox: BBox) => void
+  onTransformImage: (imageId: string, bbox: BBox) => void
+  onCropImage: (imageId: string, crop: Crop) => void
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const wrapperRef = useRef<HTMLDivElement>(null)
@@ -407,7 +770,11 @@ function PdfPageView({
       const pdfPage = await pdfDoc!.getPage(page.number + 1)
       const canvas = canvasRef.current
       if (!canvas || cancelled) return
-      const scale = 1.5 * Math.min(window.devicePixelRatio || 1, 2)
+      // Render the bitmap at the displayed CSS width (which follows the
+      // internal zoom) times the device pixel ratio, so it stays crisp at
+      // every zoom level and independent of the browser's own zoom.
+      const displayWidth = pxWidth > 0 ? pxWidth : BASE_PAGE_WIDTH * zoom
+      const scale = (displayWidth * Math.min(window.devicePixelRatio || 1, 2)) / page.width
       const viewport = pdfPage.getViewport({ scale })
       canvas.width = viewport.width
       canvas.height = viewport.height
@@ -424,25 +791,25 @@ function PdfPageView({
       cancelled = true
       renderTask?.cancel()
     }
-  }, [pdfDoc, page.number])
+  }, [pdfDoc, page.number, pxWidth, zoom, page.width])
 
   // Display scale: CSS px per PDF point, for font sizing in overlays.
   const scale = pxWidth > 0 ? pxWidth / page.width : 0
 
-  function toPercent(bbox: [number, number, number, number]) {
-    return {
-      left: `${(bbox[0] / page.width) * 100}%`,
-      top: `${(bbox[1] / page.height) * 100}%`,
-      width: `${((bbox[2] - bbox[0]) / page.width) * 100}%`,
-      height: `${((bbox[3] - bbox[1]) / page.height) * 100}%`,
+  function effectiveSpan(span: PdfSpan) {
+    const o = spanBoxes[span.id]
+    return o ? { bbox: o.bbox, origin: o.origin, size: o.size } : {
+      bbox: span.bbox,
+      origin: span.origin,
+      size: span.size,
     }
   }
 
-  function spanTextStyle(span: PdfSpan): React.CSSProperties {
+  function spanTextStyle(size: number, bbox: BBox, span: PdfSpan): React.CSSProperties {
     return {
-      fontSize: span.size * scale,
-      lineHeight: `${(span.bbox[3] - span.bbox[1]) * scale}px`,
-      fontFamily: cssFontFamily(span.font),
+      fontSize: size * scale,
+      lineHeight: `${(bbox[3] - bbox[1]) * scale}px`,
+      fontFamily: spanFontFamily(span),
       fontWeight: span.bold ? 700 : 400,
       fontStyle: span.italic ? "italic" : "normal",
       color: span.color,
@@ -452,109 +819,291 @@ function PdfPageView({
   return (
     <div
       ref={wrapperRef}
-      className="relative w-full max-w-3xl overflow-hidden rounded-md border bg-white shadow-sm"
-      style={{ aspectRatio: `${page.width} / ${page.height}` }}
+      className="relative shrink-0 overflow-hidden rounded-md border bg-white shadow-sm"
+      style={{
+        width: BASE_PAGE_WIDTH * zoom,
+        maxWidth: "none",
+        aspectRatio: `${page.width} / ${page.height}`,
+      }}
       data-page={page.number}
     >
       {!rendered ? <Skeleton className="absolute inset-0 rounded-none" /> : null}
       <canvas ref={canvasRef} className="absolute inset-0 size-full" />
+
       {page.spans.map((span) => {
+        const eff = effectiveSpan(span)
         const edited = span.id in edits
         const effectiveText = edited ? edits[span.id] : span.text
+        const isSelected =
+          selection?.type === "span" &&
+          selection.id === span.id &&
+          selection.pageIndex === page.number
         if (editingId === span.id && scale > 0) {
           return (
-            <SpanEditor
-              key={span.id}
-              span={span}
-              initialValue={effectiveText}
-              style={{ ...toPercent(span.bbox), ...spanTextStyle(span) }}
-              onCommit={onCommitEdit}
-              onCancel={onCancelEdit}
-            />
+            <div key={span.id}>
+              <SpanEditor
+                span={span}
+                initialValue={effectiveText}
+                style={{
+                  ...bboxToPercent(eff.bbox, page.width, page.height),
+                  ...spanTextStyle(eff.size, eff.bbox, span),
+                }}
+                onCommit={onCommitEdit}
+                onCancel={onCancelEdit}
+              />
+              <GeometryOverlay
+                bbox={eff.bbox}
+                pageWidth={page.width}
+                pageHeight={page.height}
+                colorClass="ring-primary"
+                allowMove={false}
+                onChange={(bbox) => onResizeSpan(span, bbox)}
+              />
+            </div>
           )
         }
         return (
-          <button
-            key={span.id}
-            type="button"
-            title={effectiveText}
-            aria-label={`Texte : ${effectiveText}`}
-            className={cn(
-              "absolute cursor-text rounded-xs text-left whitespace-nowrap",
-              edited ? "bg-white" : "bg-transparent text-transparent",
-              selection?.type === "span" &&
-                selection.id === span.id &&
-                selection.pageIndex === page.number
-                ? "ring-2 ring-primary"
-                : edited
-                  ? "ring-1 ring-primary/40 hover:ring-2 hover:ring-primary/60"
-                  : "hover:bg-primary/5 hover:ring-2 hover:ring-primary/40"
-            )}
-            style={{
-              ...toPercent(span.bbox),
-              ...(edited && scale > 0 ? spanTextStyle(span) : {}),
-            }}
-            onClick={() => {
-              onSelect({ pageIndex: page.number, type: "span", id: span.id })
-              onStartEdit(span.id)
-            }}
-          >
-            {edited && scale > 0 ? edits[span.id] : null}
-          </button>
+          <div key={span.id}>
+            <button
+              type="button"
+              title={effectiveText}
+              aria-label={`Texte : ${effectiveText}`}
+              className={cn(
+                "absolute cursor-text rounded-xs text-left whitespace-nowrap",
+                edited ? "bg-white" : "bg-transparent text-transparent",
+                isSelected
+                  ? "ring-2 ring-primary"
+                  : edited
+                    ? "ring-1 ring-primary/40 hover:ring-2 hover:ring-primary/60"
+                    : "hover:bg-primary/5 hover:ring-2 hover:ring-primary/40"
+              )}
+              style={{
+                ...bboxToPercent(eff.bbox, page.width, page.height),
+                ...(edited && scale > 0 ? spanTextStyle(eff.size, eff.bbox, span) : {}),
+              }}
+              onClick={() => {
+                onSelect({ pageIndex: page.number, type: "span", id: span.id })
+                onStartEdit(span.id)
+              }}
+            >
+              {edited && scale > 0 ? edits[span.id] : null}
+            </button>
+            {isSelected && scale > 0 ? (
+              <GeometryOverlay
+                bbox={eff.bbox}
+                pageWidth={page.width}
+                pageHeight={page.height}
+                colorClass="ring-primary"
+                allowMove={false}
+                onChange={(bbox) => onResizeSpan(span, bbox)}
+              />
+            ) : null}
+          </div>
         )
       })}
+
       {page.images.map((image) => {
         const edit = imageEdits[image.id]
         const isSelected =
           selection?.type === "image" &&
           selection.id === image.id &&
           selection.pageIndex === page.number
+        const transform = edit?.type === "transform" ? edit : null
+        const effBbox: BBox = transform ? transform.bbox : image.bbox
+        const src = transform?.dataUrl ?? imageSrc(image.xref)
+        const cropping = croppingId === image.id && isSelected && transform !== null
+
         return (
-          <button
-            key={image.id}
-            type="button"
-            aria-label={
-              edit?.type === "delete"
-                ? "Image supprimée"
-                : edit?.type === "replace"
-                  ? "Image remplacée"
-                  : "Image"
-            }
-            className={cn(
-              "absolute cursor-pointer overflow-hidden rounded-xs",
-              edit?.type === "delete" && "bg-white",
-              isSelected
-                ? "ring-2 ring-chart-2"
-                : edit
-                  ? "ring-1 ring-chart-2/60 hover:ring-2 hover:ring-chart-2"
-                  : "hover:bg-chart-2/10 hover:ring-2 hover:ring-chart-2/50"
-            )}
-            style={toPercent(image.bbox)}
-            onClick={() =>
-              onSelect({ pageIndex: page.number, type: "image", id: image.id })
-            }
-          >
-            {edit?.type === "replace" ? (
-              // Stretched into the original bbox, exactly like the export does.
-              // eslint-disable-next-line @next/next/no-img-element
-              <img
-                src={edit.dataUrl}
-                alt="Aperçu du remplacement"
-                className="size-full"
-                style={{ objectFit: "fill" }}
+          <div key={image.id}>
+            {/* Cover the original placement whenever the image moved/was removed. */}
+            {edit ? (
+              <div
+                aria-hidden="true"
+                className="absolute bg-white"
+                style={bboxToPercent(image.bbox, page.width, page.height)}
               />
             ) : null}
-            {edit?.type === "delete" ? (
-              <span className="flex size-full items-center justify-center border border-dashed border-muted-foreground/40">
-                <ImageOffIcon
-                  className="size-4 text-muted-foreground/60"
-                  aria-hidden="true"
+
+            <button
+              type="button"
+              aria-label={
+                edit?.type === "delete"
+                  ? "Image supprimée"
+                  : transform
+                    ? "Image modifiée"
+                    : "Image"
+              }
+              className={cn(
+                "absolute cursor-pointer overflow-hidden rounded-xs",
+                edit?.type === "delete" && "bg-white",
+                isSelected
+                  ? "ring-2 ring-chart-2"
+                  : edit
+                    ? "ring-1 ring-chart-2/60 hover:ring-2 hover:ring-chart-2"
+                    : "hover:bg-chart-2/10 hover:ring-2 hover:ring-chart-2/50"
+              )}
+              style={bboxToPercent(
+                edit?.type === "delete" ? image.bbox : effBbox,
+                page.width,
+                page.height
+              )}
+              onClick={() =>
+                onSelect({ pageIndex: page.number, type: "image", id: image.id })
+              }
+            >
+              {transform && !cropping ? (
+                <span
+                  className="block size-full"
+                  style={cropFillStyle(src, transform.crop)}
                 />
-              </span>
+              ) : null}
+              {transform && cropping ? (
+                <span
+                  className="block size-full"
+                  style={cropFillStyle(src, null)}
+                />
+              ) : null}
+              {edit?.type === "delete" ? (
+                <span className="flex size-full items-center justify-center border border-dashed border-muted-foreground/40">
+                  <ImageOffIcon
+                    className="size-4 text-muted-foreground/60"
+                    aria-hidden="true"
+                  />
+                </span>
+              ) : null}
+            </button>
+
+            {/* Geometry handles when selected (move/resize), unless cropping. */}
+            {isSelected && edit?.type !== "delete" && !cropping ? (
+              <GeometryOverlay
+                bbox={effBbox}
+                pageWidth={page.width}
+                pageHeight={page.height}
+                colorClass="ring-chart-2"
+                allowMove
+                onChange={(bbox) => onTransformImage(image.id, bbox)}
+              />
             ) : null}
-          </button>
+
+            {/* Crop handles when in crop mode. */}
+            {cropping && transform ? (
+              <CropOverlay
+                bbox={effBbox}
+                crop={transform.crop ?? { left: 0, top: 0, right: 1, bottom: 1 }}
+                pageWidth={page.width}
+                pageHeight={page.height}
+                onChange={(crop) => onCropImage(image.id, crop)}
+              />
+            ) : null}
+          </div>
         )
       })}
+    </div>
+  )
+}
+
+function GeometryOverlay({
+  bbox,
+  pageWidth,
+  pageHeight,
+  colorClass,
+  allowMove,
+  onChange,
+}: {
+  bbox: BBox
+  pageWidth: number
+  pageHeight: number
+  colorClass: string
+  allowMove: boolean
+  onChange: (bbox: BBox) => void
+}) {
+  const startRef = useRef<BBox>(bbox)
+
+  function startDrag(event: React.PointerEvent, handle: string) {
+    startRef.current = bbox
+    beginPointerDrag(event, pageWidth, pageHeight, (dx, dy) => {
+      const next =
+        handle === "move"
+          ? moveBbox(startRef.current, dx, dy, pageWidth, pageHeight)
+          : resizeBbox(startRef.current, handle, dx, dy, pageWidth, pageHeight)
+      onChange(next)
+    })
+  }
+
+  return (
+    <div
+      className={cn("pointer-events-none absolute z-20 ring-2", colorClass)}
+      style={bboxToPercent(bbox, pageWidth, pageHeight)}
+    >
+      {allowMove ? (
+        <div
+          className="pointer-events-auto absolute inset-0 cursor-move"
+          onPointerDown={(e) => startDrag(e, "move")}
+        />
+      ) : null}
+      {RESIZE_HANDLES.map((h) => (
+        <div
+          key={h.id}
+          className={cn(
+            "pointer-events-auto absolute size-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full border border-white bg-primary shadow",
+            colorClass.includes("chart-2") && "bg-chart-2"
+          )}
+          style={{ left: `${h.x * 100}%`, top: `${h.y * 100}%`, cursor: h.cursor }}
+          onPointerDown={(e) => startDrag(e, h.id)}
+        />
+      ))}
+    </div>
+  )
+}
+
+function CropOverlay({
+  bbox,
+  crop,
+  pageWidth,
+  pageHeight,
+  onChange,
+}: {
+  bbox: BBox
+  crop: Crop
+  pageWidth: number
+  pageHeight: number
+  onChange: (crop: Crop) => void
+}) {
+  const startRef = useRef<Crop>(crop)
+  const boxW = bbox[2] - bbox[0]
+  const boxH = bbox[3] - bbox[1]
+
+  function startDrag(event: React.PointerEvent, handle: string) {
+    startRef.current = crop
+    beginPointerDrag(event, pageWidth, pageHeight, (dx, dy) => {
+      onChange(resizeCrop(startRef.current, handle, dx / boxW, dy / boxH))
+    })
+  }
+
+  return (
+    <div
+      className="pointer-events-none absolute z-30 overflow-hidden"
+      style={bboxToPercent(bbox, pageWidth, pageHeight)}
+    >
+      {/* The kept region; box-shadow dims everything outside it. */}
+      <div
+        className="absolute ring-2 ring-white shadow-[0_0_0_9999px_rgba(0,0,0,0.5)]"
+        style={{
+          left: `${crop.left * 100}%`,
+          top: `${crop.top * 100}%`,
+          width: `${(crop.right - crop.left) * 100}%`,
+          height: `${(crop.bottom - crop.top) * 100}%`,
+        }}
+      >
+        {RESIZE_HANDLES.map((h) => (
+          <div
+            key={h.id}
+            className="pointer-events-auto absolute size-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full border border-chart-2 bg-white shadow"
+            style={{ left: `${h.x * 100}%`, top: `${h.y * 100}%`, cursor: h.cursor }}
+            onPointerDown={(e) => startDrag(e, h.id)}
+          />
+        ))}
+      </div>
     </div>
   )
 }
@@ -605,21 +1154,28 @@ function SpanEditor({
 function SelectionPanel({
   selected,
   edits,
+  spanBoxes,
   imageEdits,
+  cropping,
   onRevert,
   onReplaceImage,
   onDeleteImage,
   onRevertImage,
+  onToggleCrop,
 }: {
   selected: { type: "span"; span: PdfSpan } | { type: "image"; image: PdfImage } | null
   edits: Record<string, string>
+  spanBoxes: Record<string, SpanBox>
   imageEdits: Record<string, ImageEdit>
+  cropping: string | null
   onRevert: (spanId: string) => void
   onReplaceImage: (imageId: string, file: File) => void
   onDeleteImage: (imageId: string) => void
   onRevertImage: (imageId: string) => void
+  onToggleCrop: (imageId: string) => void
 }) {
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const imageEdit = selected?.type === "image" ? imageEdits[selected.image.id] : undefined
   return (
     <Card>
       <CardHeader>
@@ -627,7 +1183,7 @@ function SelectionPanel({
         <CardDescription>
           {selected
             ? "Style détecté de l'élément sélectionné"
-            : "Cliquez sur un texte pour le modifier"}
+            : "Cliquez sur un texte ou une image"}
         </CardDescription>
       </CardHeader>
       {selected ? (
@@ -645,7 +1201,12 @@ function SelectionPanel({
                 <dt className="text-muted-foreground">Police</dt>
                 <dd className="truncate">{displayFontName(selected.span.font)}</dd>
                 <dt className="text-muted-foreground">Taille</dt>
-                <dd>{Math.round(selected.span.size * 10) / 10} pt</dd>
+                <dd>
+                  {Math.round(
+                    (spanBoxes[selected.span.id]?.size ?? selected.span.size) * 10
+                  ) / 10}{" "}
+                  pt
+                </dd>
                 <dt className="text-muted-foreground">Couleur</dt>
                 <dd className="flex items-center gap-2">
                   <span
@@ -663,7 +1224,11 @@ function SelectionPanel({
                   ) : null}
                 </div>
               ) : null}
-              {selected.span.id in edits ? (
+              <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                <MoveIcon className="size-3.5" aria-hidden="true" />
+                Faites glisser les poignées pour redimensionner la zone.
+              </p>
+              {selected.span.id in edits || selected.span.id in spanBoxes ? (
                 <Button
                   variant="outline"
                   size="sm"
@@ -679,11 +1244,9 @@ function SelectionPanel({
               <p className="flex items-center gap-2 font-medium">
                 <ImageIcon className="size-4 text-muted-foreground" aria-hidden="true" />
                 Image
-                {imageEdits[selected.image.id] ? (
+                {imageEdit ? (
                   <Badge variant="secondary">
-                    {imageEdits[selected.image.id].type === "delete"
-                      ? "Supprimée"
-                      : "Remplacée"}
+                    {imageEdit.type === "delete" ? "Supprimée" : "Modifiée"}
                   </Badge>
                 ) : null}
               </p>
@@ -713,7 +1276,16 @@ function SelectionPanel({
                   <ImageUpIcon data-icon="inline-start" aria-hidden="true" />
                   Remplacer l&apos;image…
                 </Button>
-                {imageEdits[selected.image.id] ? (
+                <Button
+                  variant={cropping === selected.image.id ? "default" : "outline"}
+                  size="sm"
+                  disabled={imageEdit?.type === "delete"}
+                  onClick={() => onToggleCrop(selected.image.id)}
+                >
+                  <CropIcon data-icon="inline-start" aria-hidden="true" />
+                  {cropping === selected.image.id ? "Terminer le recadrage" : "Recadrer…"}
+                </Button>
+                {imageEdit ? (
                   <Button
                     variant="outline"
                     size="sm"
@@ -733,9 +1305,10 @@ function SelectionPanel({
                   </Button>
                 )}
               </div>
-              <p className="text-xs text-muted-foreground">
-                L&apos;image de remplacement est redimensionnée dans le cadre
-                d&apos;origine.
+              <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                <MoveIcon className="size-3.5" aria-hidden="true" />
+                Faites glisser l&apos;image pour la déplacer, les poignées pour la
+                redimensionner.
               </p>
             </>
           )}
@@ -747,42 +1320,60 @@ function SelectionPanel({
 
 function EditsPanel({
   edits,
+  spanBoxes,
   imageEdits,
   spanIndex,
   imageIndex,
+  onSelect,
   onRevert,
   onRevertImage,
 }: {
   edits: Record<string, string>
+  spanBoxes: Record<string, SpanBox>
   imageEdits: Record<string, ImageEdit>
   spanIndex: Map<string, { page: PdfPageStructure; span: PdfSpan }>
   imageIndex: Map<string, { page: PdfPageStructure; image: PdfImage }>
+  onSelect: (selection: Selection) => void
   onRevert: (spanId: string) => void
   onRevertImage: (imageId: string) => void
 }) {
+  const spanIds = new Set([...Object.keys(edits), ...Object.keys(spanBoxes)])
   return (
     <Card>
       <CardHeader>
         <CardTitle>Modifications</CardTitle>
-        <CardDescription>Appliquées au PDF lors de l&apos;export</CardDescription>
+        <CardDescription>Cliquez une ligne pour la retrouver dans le PDF</CardDescription>
       </CardHeader>
       <CardContent className="flex flex-col gap-2">
-        {Object.entries(edits).map(([spanId, newText]) => {
+        {[...spanIds].map((spanId) => {
           const entry = spanIndex.get(spanId)
           if (!entry) return null
+          const newText = spanId in edits ? edits[spanId] : entry.span.text
+          const resized = spanId in spanBoxes
           return (
             <div
               key={spanId}
-              className="flex items-center justify-between gap-2 rounded-md border p-2 text-sm"
+              className="flex items-center justify-between gap-2 rounded-md border p-2 text-sm hover:bg-muted/50"
             >
-              <div className="flex min-w-0 flex-col gap-0.5">
+              <button
+                type="button"
+                className="flex min-w-0 flex-1 flex-col gap-0.5 text-left"
+                onClick={() =>
+                  onSelect({ pageIndex: entry.page.number, type: "span", id: spanId })
+                }
+              >
                 <span className="truncate text-muted-foreground line-through">
                   {entry.span.text}
                 </span>
                 <span className="truncate">
                   {newText || <em className="text-muted-foreground">(supprimé)</em>}
+                  {resized ? (
+                    <Badge variant="secondary" className="ml-1.5 align-middle">
+                      redimensionné
+                    </Badge>
+                  ) : null}
                 </span>
-              </div>
+              </button>
               <Button
                 variant="ghost"
                 size="icon-sm"
@@ -800,27 +1391,38 @@ function EditsPanel({
           return (
             <div
               key={imageId}
-              className="flex items-center justify-between gap-2 rounded-md border p-2 text-sm"
+              className="flex items-center justify-between gap-2 rounded-md border p-2 text-sm hover:bg-muted/50"
             >
-              <div className="flex min-w-0 items-center gap-2">
-                {edit.type === "replace" ? (
+              <button
+                type="button"
+                className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                onClick={() =>
+                  onSelect({ pageIndex: entry.page.number, type: "image", id: imageId })
+                }
+              >
+                {edit.type === "transform" && edit.dataUrl ? (
                   // eslint-disable-next-line @next/next/no-img-element
                   <img
                     src={edit.dataUrl}
                     alt=""
                     className="size-8 shrink-0 rounded-xs border object-cover"
                   />
-                ) : (
+                ) : edit.type === "delete" ? (
                   <ImageOffIcon
+                    className="size-4 shrink-0 text-muted-foreground"
+                    aria-hidden="true"
+                  />
+                ) : (
+                  <ImageIcon
                     className="size-4 shrink-0 text-muted-foreground"
                     aria-hidden="true"
                   />
                 )}
                 <span className="truncate">
                   Image p.{entry.page.number + 1} ·{" "}
-                  {edit.type === "delete" ? "supprimée" : "remplacée"}
+                  {edit.type === "delete" ? "supprimée" : "modifiée"}
                 </span>
-              </div>
+              </button>
               <Button
                 variant="ghost"
                 size="icon-sm"
@@ -835,4 +1437,100 @@ function EditsPanel({
       </CardContent>
     </Card>
   )
+}
+
+function VersionsDialog({
+  documentId,
+  currentVersionId,
+  documentName,
+  versions,
+}: {
+  documentId: string
+  currentVersionId: string
+  documentName: string
+  versions: VersionSummary[]
+}) {
+  return (
+    <Dialog>
+      <DialogTrigger render={<Button variant="outline" size="sm" />}>
+        <HistoryIcon data-icon="inline-start" aria-hidden="true" />
+        Versions
+      </DialogTrigger>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Versions de « {documentName} »</DialogTitle>
+          <DialogDescription>
+            Ouvrez une autre version sans quitter l&apos;éditeur.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="flex max-h-[60vh] flex-col gap-2 overflow-y-auto">
+          {versions.map((version) => {
+            const isCurrent = version.id === currentVersionId
+            return (
+              <div
+                key={version.id}
+                className={cn(
+                  "flex items-center justify-between gap-4 rounded-md border p-3",
+                  isCurrent && "border-primary bg-primary/5"
+                )}
+              >
+                <div className="flex min-w-0 flex-col gap-1">
+                  <span className="flex items-center gap-2 text-sm font-medium">
+                    {version.versionNumber === 0
+                      ? "Original"
+                      : `Version ${version.versionNumber}`}
+                    {isCurrent ? <Badge variant="secondary">Actuelle</Badge> : null}
+                  </span>
+                  <span className="text-xs text-muted-foreground">
+                    {formatDate(version.createdAt)} · {formatBytes(version.fileSize)}
+                    {version.pageCount !== null ? ` · ${version.pageCount} p.` : ""}
+                  </span>
+                </div>
+                <div className="flex shrink-0 gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={isCurrent}
+                    nativeButton={false}
+                    render={
+                      <Link
+                        href={`/documents/${documentId}/versions/${version.id}`}
+                      />
+                    }
+                  >
+                    <PencilIcon data-icon="inline-start" aria-hidden="true" />
+                    Ouvrir
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    nativeButton={false}
+                    render={
+                      <a
+                        href={`/api/documents/${documentId}/versions/${version.id}/download`}
+                        download
+                      />
+                    }
+                  >
+                    <DownloadIcon data-icon="inline-start" aria-hidden="true" />
+                    Télécharger
+                  </Button>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+/** Programmatically triggers a browser download of a same-origin URL. */
+function triggerDownload(url: string) {
+  const a = document.createElement("a")
+  a.href = url
+  a.download = ""
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
 }
