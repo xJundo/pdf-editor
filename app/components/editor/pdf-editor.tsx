@@ -91,7 +91,17 @@ export interface VersionSummary {
   name?: string | null
   fileSize: number
   pageCount: number | null
+  /** Version this one was exported from, null for the imported original. */
+  sourceVersionId?: string | null
+  /** Journal entries replayed to produce it, null when none was kept. */
+  editCount?: number | null
   createdAt: string
+}
+
+/** Rebuilds a data URL from journal base64, sniffing the format from its head. */
+function dataUrlFromBase64(base64: string): string {
+  const mime = base64.startsWith("/9j/") ? "image/jpeg" : "image/png"
+  return `data:${mime};base64,${base64}`
 }
 
 interface Selection {
@@ -126,6 +136,96 @@ function displayFontName(font: string) {
 function spanFontFamily(span: PdfSpan): string {
   const fallback = cssFontFamily(span.font)
   return span.fontFile != null ? `"pdffont-${span.fontFile}", ${fallback}` : fallback
+}
+
+/** Perceived lightness of a #rrggbb color, 0 (black) to 1 (white). */
+function colorLightness(hex: string): number {
+  const value = Number.parseInt(hex.replace("#", ""), 16)
+  if (!Number.isFinite(value)) return 0
+  const [r, g, b] = [(value >> 16) & 255, (value >> 8) & 255, value & 255]
+  return (0.299 * r + 0.587 * g + 0.114 * b) / 255
+}
+
+/**
+ * Last-resort backdrop when the page colour behind a span can't be sampled.
+ *
+ * The overlay has to hide the original glyphs painted on the canvas, so it
+ * cannot be transparent — but a fixed white one swallows light text (white
+ * titles on a colored page render as an empty box). Pick the side that keeps
+ * the span's color readable instead.
+ */
+function spanBackdrop(color: string): string {
+  return colorLightness(color) > 0.6 ? "#27272a" : "#ffffff"
+}
+
+function toHex(r: number, g: number, b: number): string {
+  return `#${[r, g, b].map((c) => c.toString(16).padStart(2, "0")).join("")}`
+}
+
+/** Ring width around a span box, in PDF points, sampled for its backdrop. */
+const BACKDROP_RING_PT = 2
+/** Share of ring pixels one colour must reach to count as "the background". */
+const BACKDROP_DOMINANCE = 0.55
+
+/**
+ * The colour actually painted around a span on the pdf.js canvas.
+ *
+ * A white title on a blue banner used to get the dark fallback backdrop, which
+ * reads as a black box over the page. Sampling the ring just outside the span
+ * box returns the real page colour there (blue), so the overlay disappears into
+ * the page. Returns null when no single colour dominates the ring (the span
+ * sits on mixed content) — the caller then falls back to `spanBackdrop`.
+ */
+function sampleBackdrop(
+  data: ImageData,
+  bbox: BBox,
+  pxPerPoint: number
+): string | null {
+  const ring = BACKDROP_RING_PT * pxPerPoint
+  const x0 = bbox[0] * pxPerPoint - ring
+  const y0 = bbox[1] * pxPerPoint - ring
+  const x1 = bbox[2] * pxPerPoint + ring
+  const y1 = bbox[3] * pxPerPoint + ring
+  const steps = 16
+  const points: [number, number][] = []
+  for (let i = 0; i <= steps; i++) {
+    const fx = x0 + ((x1 - x0) * i) / steps
+    const fy = y0 + ((y1 - y0) * i) / steps
+    points.push([fx, y0], [fx, y1], [x0, fy], [x1, fy])
+  }
+
+  // Bucket by 5-bit channels so anti-aliasing noise doesn't split the mode.
+  const counts = new Map<number, { n: number; r: number; g: number; b: number }>()
+  let total = 0
+  for (const [px, py] of points) {
+    const x = Math.round(px)
+    const y = Math.round(py)
+    if (x < 0 || y < 0 || x >= data.width || y >= data.height) continue
+    const offset = (y * data.width + x) * 4
+    const r = data.data[offset]
+    const g = data.data[offset + 1]
+    const b = data.data[offset + 2]
+    const key = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3)
+    const bucket = counts.get(key) ?? { n: 0, r: 0, g: 0, b: 0 }
+    bucket.n++
+    bucket.r += r
+    bucket.g += g
+    bucket.b += b
+    counts.set(key, bucket)
+    total++
+  }
+  if (total === 0) return null
+
+  let best: { n: number; r: number; g: number; b: number } | null = null
+  for (const bucket of counts.values()) {
+    if (!best || bucket.n > best.n) best = bucket
+  }
+  if (!best || best.n / total < BACKDROP_DOMINANCE) return null
+  return toHex(
+    Math.round(best.r / best.n),
+    Math.round(best.g / best.n),
+    Math.round(best.b / best.n)
+  )
 }
 
 // --- Geometry helpers (PDF points, top-left origin) ----------------------
@@ -246,6 +346,7 @@ export function PdfEditor({
   documentName,
   versionNumber,
   versions,
+  restoreFromVersionId = null,
 }: {
   documentId: string
   versionId: string
@@ -254,6 +355,8 @@ export function PdfEditor({
   documentName: string
   versionNumber: number
   versions: VersionSummary[]
+  /** Version whose edit journal is replayed into the editor on mount. */
+  restoreFromVersionId?: string | null
 }) {
   const router = useRouter()
   const [pdfDoc, setPdfDoc] = useState<PDFDocumentProxy | null>(null)
@@ -265,9 +368,17 @@ export function PdfEditor({
   const [editingId, setEditingId] = useState<string | null>(null)
   const [croppingId, setCroppingId] = useState<string | null>(null)
   const [exporting, setExporting] = useState(false)
+  const [restoring, setRestoring] = useState(restoreFromVersionId !== null)
   const [zoom, setZoom] = useState(1)
   const [fontsReady, setFontsReady] = useState(structure.fonts.length === 0)
   const [versionList, setVersionList] = useState(versions)
+  // Renames/deletions patch the local copy, but a fresh server list (after an
+  // export, or navigating to another version) must win over it.
+  const [versionsProp, setVersionsProp] = useState(versions)
+  if (versionsProp !== versions) {
+    setVersionsProp(versions)
+    setVersionList(versions)
+  }
 
   const [currentDocName, setCurrentDocName] = useState(documentName)
   const [renameDocOpen, setRenameDocOpen] = useState(false)
@@ -394,6 +505,21 @@ export function PdfEditor({
     return image ? { type: "image" as const, image } : null
   }, [selection, structure])
 
+  /** Journal of the open version, when its source version is still around. */
+  const resumable = useMemo(() => {
+    const current = versionList.find((v) => v.id === versionId)
+    if (!current?.sourceVersionId || !current.editCount) return null
+    const source = versionList.find((v) => v.id === current.sourceVersionId)
+    if (!source) return null
+    return {
+      editCount: current.editCount,
+      sourceVersionId: current.sourceVersionId,
+      sourceLabel:
+        source.name ??
+        (source.versionNumber === 0 ? "l'original" : `la version ${source.versionNumber}`),
+    }
+  }, [versionList, versionId])
+
   const modifiedSpanIds = useMemo(
     () => new Set([...Object.keys(edits), ...Object.keys(spanBoxes)]),
     [edits, spanBoxes]
@@ -518,6 +644,118 @@ export function PdfEditor({
       return next
     })
     if (editingId === spanId) setEditingId(null)
+  }
+
+  // Replay a stored journal (?restore=<versionId>) as pending edits, so a long
+  // series of changes can be corrected instead of redone from scratch.
+  useEffect(() => {
+    if (!restoreFromVersionId) return
+    let cancelled = false
+    async function restore() {
+      setRestoring(true)
+      try {
+        const response = await fetch(
+          `/api/documents/${documentId}/versions/${restoreFromVersionId}/journal`
+        )
+        if (!response.ok) {
+          toast.add({
+            type: "error",
+            title: "Modifications introuvables",
+            description: "L'historique de cette version n'est plus disponible.",
+          })
+          return
+        }
+        const data: { operations?: EditOperation[] } = await response.json()
+        if (cancelled || !Array.isArray(data.operations)) return
+
+        const nextEdits: Record<string, string> = {}
+        const nextBoxes: Record<string, SpanBox> = {}
+        const nextImages: Record<string, ImageEdit> = {}
+        let skipped = 0
+
+        for (const op of data.operations) {
+          if (op.type === "edit_text") {
+            const entry = spanIndex.get(op.spanId)
+            if (!entry) {
+              skipped++
+              continue
+            }
+            if (op.newText !== entry.span.text) nextEdits[op.spanId] = op.newText
+            if (op.boxResized) {
+              nextBoxes[op.spanId] = {
+                bbox: op.bbox,
+                origin: op.origin,
+                size: op.size,
+              }
+            }
+            continue
+          }
+          const entry = imageIndex.get(op.imageId)
+          if (!entry) {
+            skipped++
+            continue
+          }
+          if (op.type === "delete_image") {
+            nextImages[op.imageId] = { type: "delete" }
+          } else if (op.type === "replace_image") {
+            nextImages[op.imageId] = {
+              type: "transform",
+              bbox: entry.image.bbox,
+              crop: null,
+              dataUrl: dataUrlFromBase64(op.imageBase64),
+            }
+          } else {
+            nextImages[op.imageId] = {
+              type: "transform",
+              bbox: op.rect,
+              crop: op.crop
+                ? {
+                    left: op.crop[0],
+                    top: op.crop[1],
+                    right: op.crop[2],
+                    bottom: op.crop[3],
+                  }
+                : null,
+              dataUrl: op.imageBase64 ? dataUrlFromBase64(op.imageBase64) : null,
+            }
+          }
+        }
+
+        setEdits(nextEdits)
+        setSpanBoxes(nextBoxes)
+        setImageEdits(nextImages)
+        const restored =
+          new Set([...Object.keys(nextEdits), ...Object.keys(nextBoxes)]).size +
+          Object.keys(nextImages).length
+        toast.add({
+          type: skipped > 0 ? "warning" : "success",
+          title: `${restored} modification${restored > 1 ? "s" : ""} restaurée${restored > 1 ? "s" : ""}`,
+          description:
+            skipped > 0
+              ? `${skipped} élément(s) de l'historique sont absents de cette version.`
+              : "Ajustez ce qui doit l'être, puis exportez à nouveau.",
+        })
+      } finally {
+        if (!cancelled) setRestoring(false)
+        // Drop ?restore= so a refresh doesn't wipe edits made since.
+        router.replace(`/documents/${documentId}/versions/${versionId}`, {
+          scroll: false,
+        })
+      }
+    }
+    void restore()
+    return () => {
+      cancelled = true
+    }
+    // Runs once per restore target: spanIndex/imageIndex are derived from the
+    // structure of this version, which does not change while mounted.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [restoreFromVersionId])
+
+  function clearSelection() {
+    setSelection(null)
+    setEditingId(null)
+    setCroppingId(null)
   }
 
   function goToElement(sel: Selection) {
@@ -708,6 +946,38 @@ export function PdfEditor({
         </div>
       </div>
 
+      {resumable ? (
+        <div className="flex flex-wrap items-center gap-3 rounded-md border border-primary/30 bg-primary/5 px-3 py-2 text-sm">
+          <HistoryIcon className="size-4 text-muted-foreground" aria-hidden="true" />
+          <span>
+            Cette version a été produite par {resumable.editCount} modification
+            {(resumable.editCount ?? 0) > 1 ? "s" : ""} sur{" "}
+            {resumable.sourceLabel}.
+          </span>
+          <Button
+            variant="outline"
+            size="sm"
+            className="ml-auto"
+            nativeButton={false}
+            render={
+              <Link
+                href={`/documents/${documentId}/versions/${resumable.sourceVersionId}?restore=${versionId}`}
+              />
+            }
+          >
+            <RotateCcwIcon data-icon="inline-start" aria-hidden="true" />
+            Reprendre ces modifications
+          </Button>
+        </div>
+      ) : null}
+
+      {restoring ? (
+        <p className="flex items-center gap-2 text-sm text-muted-foreground">
+          <Spinner className="size-3.5" />
+          Restauration des modifications…
+        </p>
+      ) : null}
+
       {loadError ? (
         <p className="text-sm text-destructive">
           Le PDF n&apos;a pas pu être affiché dans le navigateur.
@@ -730,6 +1000,7 @@ export function PdfEditor({
                   croppingId={croppingId}
                   imageSrc={imageSrc}
                   onSelect={setSelection}
+                  onClearSelection={clearSelection}
                   onStartEdit={(id) => setEditingId(id)}
                   onCommitEdit={commitEdit}
                   onCancelEdit={() => setEditingId(null)}
@@ -836,6 +1107,7 @@ function PdfPageView({
   croppingId,
   imageSrc,
   onSelect,
+  onClearSelection,
   onStartEdit,
   onCommitEdit,
   onCancelEdit,
@@ -854,6 +1126,7 @@ function PdfPageView({
   croppingId: string | null
   imageSrc: (xref: number) => string
   onSelect: (selection: Selection) => void
+  onClearSelection: () => void
   onStartEdit: (spanId: string) => void
   onCommitEdit: (span: PdfSpan, draft: string) => void
   onCancelEdit: () => void
@@ -865,6 +1138,10 @@ function PdfPageView({
   const wrapperRef = useRef<HTMLDivElement>(null)
   const [rendered, setRendered] = useState(false)
   const [pxWidth, setPxWidth] = useState(0)
+  // Page colour behind each span, read once from the painted canvas. Zoom
+  // does not change it, so it is sampled on the first render only.
+  const [backdrops, setBackdrops] = useState<Record<string, string>>({})
+  const sampledRef = useRef(false)
 
   useEffect(() => {
     const wrapper = wrapperRef.current
@@ -909,6 +1186,33 @@ function PdfPageView({
     }
   }, [pdfDoc, page.number, pxWidth, zoom, page.width])
 
+  useEffect(() => {
+    if (!rendered || sampledRef.current) return
+    // Read after paint: the canvas is the external source of truth here.
+    const frame = requestAnimationFrame(() => {
+      const canvas = canvasRef.current
+      if (!canvas || canvas.width === 0) return
+      const context = canvas.getContext("2d", { willReadFrequently: false })
+      if (!context) return
+      sampledRef.current = true
+      let data: ImageData
+      try {
+        data = context.getImageData(0, 0, canvas.width, canvas.height)
+      } catch {
+        // Tainted canvas: keep the contrast-based fallback.
+        return
+      }
+      const pxPerPoint = canvas.width / page.width
+      const sampled: Record<string, string> = {}
+      for (const span of page.spans) {
+        const color = sampleBackdrop(data, span.bbox, pxPerPoint)
+        if (color) sampled[span.id] = color
+      }
+      setBackdrops(sampled)
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [rendered, page.spans, page.width])
+
   // Display scale: CSS px per PDF point, for font sizing in overlays.
   const scale = pxWidth > 0 ? pxWidth / page.width : 0
 
@@ -929,6 +1233,7 @@ function PdfPageView({
       fontWeight: span.bold ? 700 : 400,
       fontStyle: span.italic ? "italic" : "normal",
       color: span.color,
+      backgroundColor: backdrops[span.id] ?? spanBackdrop(span.color),
     }
   }
 
@@ -942,6 +1247,19 @@ function PdfPageView({
         aspectRatio: `${page.width} / ${page.height}`,
       }}
       data-page={page.number}
+      // Clicking bare page content (no span, no image overlay) drops the
+      // selection: once an edit is committed its handles must stop following
+      // the element around as if it were still being edited.
+      onClick={(event) => {
+        const target = event.target as HTMLElement
+        if (
+          target === event.currentTarget ||
+          target === canvasRef.current ||
+          target.dataset.pageBackdrop === "true"
+        ) {
+          onClearSelection()
+        }
+      }}
     >
       {!rendered ? <Skeleton className="absolute inset-0 rounded-none" /> : null}
       <canvas ref={canvasRef} className="absolute inset-0 size-full" />
@@ -988,7 +1306,9 @@ function PdfPageView({
                 // z-10 keeps text spans above image overlays so text drawn on
                 // top of an image (e.g. a stamp) stays clickable.
                 "absolute z-10 cursor-text rounded-xs text-left whitespace-pre",
-                edited ? "bg-white" : "bg-transparent text-transparent",
+                // Clipped: text longer than its box must not paint over the
+                // neighbouring content (the export shrinks it to fit instead).
+                edited ? "overflow-hidden" : "bg-transparent text-transparent",
                 isSelected
                   ? "ring-2 ring-primary"
                   : edited
@@ -1043,6 +1363,7 @@ function PdfPageView({
             {edit ? (
               <div
                 aria-hidden="true"
+                data-page-backdrop="true"
                 className="absolute bg-white"
                 style={bboxToPercent(image.bbox, page.width, page.height)}
               />
@@ -1258,7 +1579,7 @@ function SpanEditor({
       ref={inputRef}
       value={draft}
       aria-label="Modifier le texte"
-      className="absolute z-10 min-w-24 rounded-xs bg-white p-0 ring-2 ring-primary outline-none"
+      className="absolute z-10 min-w-24 rounded-xs p-0 ring-2 ring-primary outline-none"
       style={style}
       onChange={(event) => setDraft(event.target.value)}
       onBlur={() => onCommit(span, draft)}
@@ -1645,7 +1966,9 @@ function VersionsDialog({
           <HistoryIcon data-icon="inline-start" aria-hidden="true" />
           Versions
         </DialogTrigger>
-        <DialogContent>
+        {/* Each row carries up to a 5-button action group, so the default sm
+            width would squeeze the name/metadata column to a few characters. */}
+        <DialogContent className="sm:max-w-3xl">
           <DialogHeader>
             <DialogTitle>Versions de « {documentName} »</DialogTitle>
             <DialogDescription>
@@ -1655,6 +1978,13 @@ function VersionsDialog({
           <div className="flex max-h-[60vh] flex-col gap-2 overflow-y-auto">
             {versions.map((version) => {
               const isCurrent = version.id === currentVersionId
+              // Its journal can be resumed only if the version it was exported
+              // from still exists to replay it on.
+              const resumeFrom =
+                version.editCount && version.sourceVersionId &&
+                versions.some((v) => v.id === version.sourceVersionId)
+                  ? version.sourceVersionId
+                  : null
               return (
                 <div
                   key={version.id}
@@ -1677,12 +2007,28 @@ function VersionsDialog({
                       ) : null}
                       {isCurrent ? <Badge variant="secondary">Actuelle</Badge> : null}
                     </div>
-                    <span className="text-xs text-muted-foreground">
+                    <span className="truncate text-xs whitespace-nowrap text-muted-foreground">
                       {formatDate(version.createdAt)} · {formatBytes(version.fileSize)}
                       {version.pageCount !== null ? ` · ${version.pageCount} p.` : ""}
                     </span>
                   </div>
                   <div className="flex shrink-0 gap-2">
+                    {resumeFrom ? (
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        aria-label={`Reprendre les ${version.editCount} modifications de cette version`}
+                        title={`Reprendre les ${version.editCount} modifications`}
+                        nativeButton={false}
+                        render={
+                          <Link
+                            href={`/documents/${documentId}/versions/${resumeFrom}?restore=${version.id}`}
+                          />
+                        }
+                      >
+                        <RotateCcwIcon aria-hidden="true" />
+                      </Button>
+                    ) : null}
                     <Button
                       variant="ghost"
                       size="icon-sm"

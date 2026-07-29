@@ -90,12 +90,18 @@ export async function DELETE(
     .where(
       and(eq(documentVersions.id, versionId), eq(documentVersions.documentId, documentId))
     )
-    .returning({ filePath: documentVersions.filePath })
+    .returning({
+      filePath: documentVersions.filePath,
+      journalPath: documentVersions.journalPath,
+    })
 
   if (!deleted) {
     return Response.json({ error: "Version introuvable." }, { status: 404 })
   }
 
   await rm(absoluteFilePath(deleted.filePath), { force: true })
+  if (deleted.journalPath) {
+    await rm(absoluteFilePath(deleted.journalPath), { force: true })
+  }
   return Response.json({ ok: true })
 }

@@ -36,6 +36,11 @@ export const documentVersions = pgTable(
     name: text("name"),
     sourceVersionId: uuid("source_version_id"),
     filePath: text("file_path").notNull(),
+    // Edit journal that produced this version, kept on the volume next to the
+    // PDF (it embeds base64 images, which never belong in the database).
+    // Replaying it on sourceVersionId restores the editor state that made it.
+    journalPath: text("journal_path"),
+    editCount: integer("edit_count"),
     fileSize: bigint("file_size", { mode: "number" }).notNull(),
     pageCount: integer("page_count"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),

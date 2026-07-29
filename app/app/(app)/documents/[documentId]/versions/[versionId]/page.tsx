@@ -9,11 +9,16 @@ import { requireSession } from "@/lib/session"
 
 export default async function EditorPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ documentId: string; versionId: string }>
+  searchParams: Promise<{ restore?: string }>
 }) {
   const session = await requireSession()
   const { documentId, versionId } = await params
+  // ?restore=<versionId>: reload that version's edit journal into the editor
+  // (the journal is fetched client-side — it can carry base64 images).
+  const { restore } = await searchParams
 
   const version = await getOwnedVersion(session.user.id, documentId, versionId)
   if (!version) {
@@ -45,12 +50,15 @@ export default async function EditorPage({
       structure={structure}
       documentName={version.name}
       versionNumber={version.versionNumber}
+      restoreFromVersionId={restore ?? null}
       versions={versions.map((v) => ({
         id: v.id,
         versionNumber: v.versionNumber,
         name: v.name,
         fileSize: Number(v.fileSize),
         pageCount: v.pageCount,
+        sourceVersionId: v.sourceVersionId,
+        editCount: v.editCount,
         createdAt: v.createdAt.toISOString(),
       }))}
     />

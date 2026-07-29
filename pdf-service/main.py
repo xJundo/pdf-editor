@@ -10,13 +10,15 @@ import binascii
 import functools
 import io
 import os
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Annotated, Literal
 
 import pymupdf
 from fastapi import FastAPI, HTTPException, Response
-from fontTools.ttLib import TTFont
+from fontTools.ttLib import TTFont, newTable
+from fontTools.ttLib.tables._c_m_a_p import CmapSubtable
 from pydantic import BaseModel, Field
 
 FILES_ROOT = Path(os.environ.get("FILES_ROOT", "/data/files")).resolve()
@@ -83,11 +85,7 @@ def _color_to_hex(color: int) -> str:
 
 
 def _font_has_unicode_cmap(buffer: bytes) -> bool:
-    """True if a font program exposes a real unicode cmap (safe for CSS @font-face).
-
-    Identity-H subsets without a unicode cmap would render as tofu in the
-    browser, so those are excluded and the front falls back to a look-alike.
-    """
+    """True if a font program exposes a real unicode cmap."""
     try:
         tt = TTFont(io.BytesIO(buffer), fontNumber=0, lazy=True)
     except Exception:
@@ -100,24 +98,225 @@ def _font_has_unicode_cmap(buffer: bytes) -> bool:
         tt.close()
 
 
+_HEX_TOKEN = r"<([0-9A-Fa-f]+)>"
+
+
+def _utf16be_codepoint(hex_digits: str) -> int | None:
+    """Sole code point of a ToUnicode destination, or None if it is not one.
+
+    Multi-character destinations are ligatures: <00AA> <00660069> says "glyph
+    0xAA displays as fi". Reversing that to f -> 0xAA is wrong — it would make
+    every f render as "fi", so "file" comes out "fiile". A ligature has no
+    single-character inverse and must be dropped, not truncated.
+    """
+    try:
+        text = bytes.fromhex(hex_digits).decode("utf-16-be")
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return ord(text) if len(text) == 1 else None
+
+
+def parse_tounicode(cmap_source: str) -> dict[int, int]:
+    """Parse a ToUnicode CMap into {unicode code point -> character code}.
+
+    Covers the three constructs producers emit: bfchar (<src> <dst>), and
+    bfrange in both its contiguous form (<lo> <hi> <dst_base>) and its array
+    form (<lo> <hi> [<dst> <dst> ...]). First writer wins, so the lowest code
+    backing a given character is the one used.
+    """
+    mapping: dict[int, int] = {}
+    for block in re.findall(r"beginbfchar(.*?)endbfchar", cmap_source, re.S):
+        for src, dst in re.findall(rf"{_HEX_TOKEN}\s+{_HEX_TOKEN}", block):
+            code_point = _utf16be_codepoint(dst)
+            if code_point is not None:
+                mapping.setdefault(code_point, int(src, 16))
+    for block in re.findall(r"beginbfrange(.*?)endbfrange", cmap_source, re.S):
+        # Array form first: its entries would otherwise be misread as a run of
+        # contiguous triples by the pattern below.
+        array_pattern = rf"{_HEX_TOKEN}\s+{_HEX_TOKEN}\s*\[([^\]]*)\]"
+        consumed: list[str] = []
+        for match in re.finditer(array_pattern, block):
+            consumed.append(match.group(0))
+            low_code = int(match.group(1), 16)
+            for offset, dst in enumerate(re.findall(_HEX_TOKEN, match.group(3))):
+                code_point = _utf16be_codepoint(dst)
+                if code_point is not None:
+                    mapping.setdefault(code_point, low_code + offset)
+        for chunk in consumed:
+            block = block.replace(chunk, " ")
+        pattern = rf"{_HEX_TOKEN}\s+{_HEX_TOKEN}\s+{_HEX_TOKEN}"
+        for low, high, dst in re.findall(pattern, block):
+            low_code, high_code = int(low, 16), int(high, 16)
+            base = _utf16be_codepoint(dst)
+            if base is None or not 0 <= high_code - low_code <= 0xFFFF:
+                continue
+            for offset in range(high_code - low_code + 1):
+                mapping.setdefault(base + offset, low_code + offset)
+    return mapping
+
+
+def _new_cmap_subtable(fmt: int, platform_id: int, encoding_id: int, table: dict):
+    subtable = CmapSubtable.newSubtable(fmt)
+    subtable.platformID = platform_id
+    subtable.platEncID = encoding_id
+    subtable.language = 0
+    subtable.cmap = dict(table)
+    if fmt == 12:
+        subtable.format, subtable.reserved, subtable.length = 12, 0, 0
+        subtable.nGroups = 0
+    return subtable
+
+
+def _with_synthesized_cmap(buffer: bytes, mapping: dict[int, int]) -> bytes | None:
+    """Rebuild a font program with a unicode cmap derived from `mapping`.
+
+    Identity-H CID fonts are indexed by glyph id and ship no cmap at all, so
+    neither the browser (@font-face) nor PyMuPDF can go from a character to a
+    glyph. With /CIDToGIDMap /Identity the character code *is* the glyph id,
+    so the ToUnicode map read backwards gives exactly the missing table.
+    """
+    try:
+        tt = TTFont(io.BytesIO(buffer), fontNumber=0)
+        glyph_order = tt.getGlyphOrder()
+        table = {
+            code_point: glyph_order[gid]
+            for code_point, gid in mapping.items()
+            if 0 < gid < len(glyph_order)
+        }
+        if not table:
+            return None
+        cmap = newTable("cmap")
+        cmap.tableVersion = 0
+        bmp = {cp: name for cp, name in table.items() if cp <= 0xFFFF}
+        # (3,1) is what Windows/browsers look for, (0,3) what some readers want.
+        cmap.tables = [
+            _new_cmap_subtable(4, platform_id, encoding_id, bmp)
+            for platform_id, encoding_id in ((3, 1), (0, 3))
+            if bmp
+        ]
+        if len(table) > len(bmp):
+            cmap.tables.append(_new_cmap_subtable(12, 3, 10, table))
+        tt["cmap"] = cmap
+        _ensure_post_table(tt)
+        out = io.BytesIO()
+        tt.save(out)
+        return out.getvalue()
+    except Exception:
+        return None
+
+
+def _ensure_post_table(tt: TTFont) -> None:
+    """Add a minimal `post` table when the subset dropped it.
+
+    PDF embedding has no use for `post`, so subsetters routinely strip it —
+    but browsers run every @font-face through the OpenType sanitizer, which
+    rejects a TrueType font outright when `post` is missing. Version 3.0
+    declares "no glyph names", which is all that is needed here.
+    """
+    if "post" in tt:
+        return
+    post = newTable("post")
+    post.formatType = 3.0
+    post.italicAngle = 0.0
+    post.underlinePosition = 0
+    post.underlineThickness = 0
+    post.isFixedPitch = 0
+    post.minMemType42 = post.maxMemType42 = 0
+    post.minMemType1 = post.maxMemType1 = 0
+    tt["post"] = post
+
+
+def preview_font_buffer(doc: pymupdf.Document, xref: int) -> tuple[bytes, str] | None:
+    """Font program to expose to the editor as @font-face, or None.
+
+    Prefers the *complete* family (same lookup the export uses) over the
+    document's embedded subset. A subset only carries the glyphs the original
+    text needed, and CSS falls back per character, so previewing through it
+    renders any newly typed letter in a different typeface mid-word — while
+    the export, which resolves the full family, renders it correctly. Serving
+    the same file to both is what keeps them honest.
+    """
+    basefont = doc.xref_get_key(xref, "BaseFont")
+    if basefont and basefont[0] == "name":
+        resolved = resolve_family_file(basefont[1].lstrip("/"))
+        if resolved is not None:
+            path, _source = resolved
+            try:
+                return path.read_bytes(), path.suffix.lstrip(".").lower()
+            except OSError:
+                pass
+    return embedded_font_buffer(doc, xref)
+
+
+def _maps_code_to_glyph_id(doc: pymupdf.Document, xref: int) -> bool:
+    """True if this font's character codes *are* its glyph indices.
+
+    That equivalence is what lets a ToUnicode map be reversed into a cmap,
+    and it only holds for a Type0 font with Identity encoding whose
+    descendant uses /CIDToGIDMap /Identity (the default for CIDFontType2).
+    A simple TrueType font maps codes through /Encoding instead, and a
+    CIDToGIDMap *stream* remaps them explicitly — synthesizing a cmap from
+    either would silently point every character at the wrong glyph.
+    """
+    subtype = doc.xref_get_key(xref, "Subtype")
+    if not subtype or subtype[1] != "/Type0":
+        return False
+    encoding = doc.xref_get_key(xref, "Encoding")
+    if not encoding or encoding[1] not in ("/Identity-H", "/Identity-V"):
+        return False
+    descendants = doc.xref_get_key(xref, "DescendantFonts")
+    if not descendants or descendants[0] == "null":
+        return False
+    match = re.search(r"(\d+)\s+\d+\s+R", descendants[1])
+    if not match:
+        return False
+    cid_to_gid = doc.xref_get_key(int(match.group(1)), "CIDToGIDMap")
+    # Absent defaults to Identity per the spec — and PyMuPDF reports absence
+    # as the truthy tuple ("null", "null"), so it has to be matched explicitly
+    # rather than by falsiness. A name must say Identity; a stream never is.
+    return cid_to_gid[0] == "null" or cid_to_gid[1] == "/Identity"
+
+
+def embedded_font_buffer(doc: pymupdf.Document, xref: int) -> tuple[bytes, str] | None:
+    """Extract a font program, adding a unicode cmap when it lacks one.
+
+    Returns (buffer, extension) or None when the font is not embedded, not a
+    supported format, or cannot be made unicode-addressable.
+    """
+    try:
+        _name, ext, _type, buffer = doc.extract_font(xref)
+    except Exception:
+        return None
+    if not buffer or ext not in ("ttf", "otf"):
+        return None
+    if _font_has_unicode_cmap(buffer):
+        return buffer, ext
+    if not _maps_code_to_glyph_id(doc, xref):
+        return None
+    tounicode = doc.xref_get_key(xref, "ToUnicode")
+    if not tounicode or tounicode[0] != "xref":
+        return None
+    try:
+        source = doc.xref_stream(int(tounicode[1].split()[0])).decode("latin-1")
+    except Exception:
+        return None
+    patched = _with_synthesized_cmap(buffer, parse_tounicode(source))
+    return (patched, ext) if patched else None
+
+
 def page_preview_fonts(
     doc: pymupdf.Document, page: pymupdf.Page
 ) -> dict[str, tuple[int, str]]:
     """Map normalized embedded font names to (xref, css-format) for the preview.
 
-    Only ttf/otf programs carrying a unicode cmap are offered — those the
-    browser can load via @font-face and map text to correctly.
+    Only ttf/otf programs the browser can address by character are offered —
+    either they already carry a unicode cmap, or one is synthesized from the
+    font's ToUnicode map (see embedded_font_buffer).
     """
     result: dict[str, tuple[int, str]] = {}
     for entry in page.get_fonts(full=True):
         xref, ext, basefont = entry[0], entry[1], entry[3]
-        if ext not in ("ttf", "otf"):
-            continue
-        try:
-            _name, _ext, _type, buffer = doc.extract_font(xref)
-        except Exception:
-            continue
-        if not buffer or not _font_has_unicode_cmap(buffer):
+        if ext not in ("ttf", "otf") or preview_font_buffer(doc, xref) is None:
             continue
         result[_normalize_font_name(basefont)] = (
             xref,
@@ -133,12 +332,10 @@ def document_font(path: str, xref: int) -> Response:
     with pymupdf.open(file) as doc:
         if not 0 < xref < doc.xref_length():
             raise HTTPException(status_code=404, detail="font not found")
-        try:
-            _name, ext, _type, buffer = doc.extract_font(xref)
-        except Exception as exc:
-            raise HTTPException(status_code=404, detail="font not found") from exc
-        if not buffer or ext not in ("ttf", "otf"):
+        extracted = preview_font_buffer(doc, xref)
+        if extracted is None:
             raise HTTPException(status_code=404, detail="font not extractable")
+        buffer, ext = extracted
         media = "font/ttf" if ext == "ttf" else "font/otf"
         return Response(content=buffer, media_type=media)
 
@@ -340,9 +537,13 @@ class ExportRequest(BaseModel):
 # Order of preference when reinserting edited text:
 #   1. the span's own embedded font, if its (often subsetted) glyph table
 #      covers every character of the new text;
-#   2. a metrically close free font (Liberation, then Noto/DejaVu) matching
+#   2. the *same typeface* in full, resolved by family name from the font
+#      library (see resolve_named_font) — embedded subsets only carry the
+#      glyphs the original document used, so typing any new character drops
+#      out of (1) even though the typeface itself is perfectly identifiable;
+#   3. a metrically close free font (Liberation, then Noto/DejaVu) matching
 #      family/weight/style;
-#   3. a base-14 standard font as last resort.
+#   4. a base-14 standard font as last resort.
 
 _BASE14 = {
     "sans": {(False, False): "helv", (True, False): "hebo", (False, True): "heit", (True, True): "hebi"},
@@ -394,9 +595,255 @@ def pick_family_and_style(font_name: str, bold: bool, italic: bool) -> tuple[str
     return family, bold, italic
 
 
+# --- Font library: resolving a typeface by name --------------------------
+#
+# Downloaded/user-supplied fonts live here. Keeping it on the shared volume
+# means a family is fetched once and then reused by every later export, and
+# that operators can drop in licensed fonts we could never download.
+FONTS_DIR = Path(os.environ.get("FONTS_DIR", "/data/fonts"))
+
+# Outbound fetching is opt-out: without it the service still works, it just
+# falls back to look-alikes for any typeface not already in FONTS_DIR.
+FONT_DOWNLOAD_ENABLED = os.environ.get("FONT_DOWNLOAD_ENABLED", "1") != "0"
+FONT_DOWNLOAD_TIMEOUT = float(os.environ.get("FONT_DOWNLOAD_TIMEOUT", "10"))
+
+# Weight/style words that name a *variant* rather than the family itself.
+# "Roman" is deliberately absent: it is part of Times New Roman far more
+# often than it is a weight marker.
+_STYLE_WORDS = {
+    "regular": (False, False), "normal": (False, False), "book": (False, False),
+    "italic": (False, True), "oblique": (False, True),
+    "bold": (True, False), "semibold": (True, False), "demibold": (True, False),
+    "extrabold": (True, False), "ultrabold": (True, False), "black": (True, False),
+    "heavy": (True, False), "medium": (False, False), "light": (False, False),
+    "extralight": (False, False), "ultralight": (False, False), "thin": (False, False),
+}
+# Camel-case splits "SemiBold" into two words; these glue back onto the next.
+_STYLE_PREFIXES = ("semi", "demi", "extra", "ultra")
+# Foundry/format markers glued onto PostScript names (TimesNewRomanPSMT).
+_NAME_NOISE = {"mt", "ps", "psmt", "pscm"}
+
+
+def parse_font_name(font_name: str) -> tuple[str, bool, bool]:
+    """Split a PDF font name into (family, bold, italic).
+
+    PDF font names are PostScript names, so the family is welded to its
+    variant and to the subset prefix: "IUNIYH+Anton-Regular",
+    "IBMPlexSans-SemiBold", "TimesNewRomanPSMT". Splitting on separators and
+    on camel-case boundaries recovers the words, and any word that names a
+    weight or a slant is peeled off as style rather than kept as family.
+    """
+    name = font_name.split("+")[-1].split(",")[0]
+    words: list[str] = []
+    for chunk in re.split(r"[-_\s]+", name):
+        # "IBMPlexSans" -> IBM, Plex, Sans; "Anton2" -> Anton, 2
+        words.extend(re.findall(r"[A-Z]+(?![a-z])|[A-Z][a-z]*|[a-z]+|[0-9]+", chunk))
+    merged: list[str] = []
+    for word in words:
+        if merged and merged[-1].lower() in _STYLE_PREFIXES:
+            merged[-1] += word
+        else:
+            merged.append(word)
+    family_words, bold, italic = [], False, False
+    for word in merged:
+        key = word.lower()
+        if key in _STYLE_WORDS:
+            word_bold, word_italic = _STYLE_WORDS[key]
+            bold, italic = bold or word_bold, italic or word_italic
+        elif key not in _NAME_NOISE:
+            family_words.append(word)
+    return " ".join(family_words), bold, italic
+
+
+def _font_identity(path: Path) -> tuple[str, bool, bool] | None:
+    """(family, bold, italic) a font file declares for itself, or None.
+
+    Both name records matter: id 1 carries the family alone ("Anton") and id 2
+    the subfamily ("Bold Italic"). Reading only id 1 would file every weight of
+    a family under the same key, so a bold lookup would quietly get the
+    regular cut — and never re-download the bold one.
+    """
+    try:
+        tt = TTFont(path, fontNumber=0, lazy=True)
+    except Exception:
+        return None
+    try:
+        if "name" not in tt:
+            return None
+        family = tt["name"].getDebugName(1)
+        subfamily = tt["name"].getDebugName(2) or ""
+    except Exception:
+        return None
+    finally:
+        tt.close()
+    if not family:
+        return None
+    _ignored, bold, italic = parse_font_name(subfamily)
+    return family, bold, italic
+
+
+def _variant_filename(family: str, bold: bool, italic: bool) -> str:
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", family).strip("-")
+    return f"{slug}-{'700' if bold else '400'}-{'italic' if italic else 'normal'}.ttf"
+
+
+# Cached index plus the directory mtime it was built from. Creating,
+# replacing or deleting a font file bumps that mtime, so a download landing
+# mid-process invalidates the cache on its own.
+_library_cache: tuple[int, dict[tuple[str, bool, bool], Path]] | None = None
+
+
+def font_library_index() -> dict[tuple[str, bool, bool], Path]:
+    """Index FONTS_DIR by (normalized family, bold, italic).
+
+    Cached against the directory mtime: this runs once per font per page
+    during extraction and once per edit during export, and each rebuild
+    parses the name table of every file in the library.
+    """
+    global _library_cache
+    try:
+        stamp = FONTS_DIR.stat().st_mtime_ns
+    except OSError:
+        return {}
+    if _library_cache is not None and _library_cache[0] == stamp:
+        return _library_cache[1]
+    index: dict[tuple[str, bool, bool], Path] = {}
+    for path in sorted(FONTS_DIR.iterdir()):
+        if path.suffix.lower() not in (".ttf", ".otf"):
+            continue
+        # Fall back to the filename for files we cannot introspect.
+        identity = _font_identity(path) or parse_font_name(path.stem)
+        family, bold, italic = identity
+        if family:
+            index.setdefault((_normalize_font_name(family), bold, italic), path)
+    _library_cache = (stamp, index)
+    return index
+
+
+def _google_font_url(family: str, bold: bool, italic: bool) -> str | None:
+    """Ask the Google Fonts CSS API for a direct TrueType URL, or None.
+
+    A legacy User-Agent matters: modern ones are served woff2, which PyMuPDF
+    cannot read, while an old one gets plain .ttf.
+    """
+    from urllib.error import HTTPError
+    from urllib.parse import quote
+    from urllib.request import Request, urlopen
+
+    axis = f":ital,wght@{1 if italic else 0},{700 if bold else 400}"
+    for suffix in (axis, ""):
+        url = f"https://fonts.googleapis.com/css2?family={quote(family)}{suffix}"
+        try:
+            request = Request(url, headers={"User-Agent": "Mozilla/4.0"})
+            with urlopen(request, timeout=FONT_DOWNLOAD_TIMEOUT) as response:
+                css = response.read().decode("utf-8", "replace")
+        except HTTPError:
+            continue  # unknown family, or that weight/slant is not published
+        except Exception:
+            return None  # network down: retrying the bare family just re-waits
+        match = re.search(r"src:\s*url\((https://[^)]+?\.ttf)\)", css)
+        if match:
+            return match.group(1)
+    return None
+
+
+# Families the network could not supply, so an export never pays that latency
+# twice. Process-local on purpose: a restart re-tries, which is what you want
+# after fixing connectivity.
+_UNAVAILABLE_FAMILIES: set[tuple[str, bool, bool]] = set()
+
+
+def download_font(family: str, bold: bool, italic: bool) -> Path | None:
+    """Fetch a family from Google Fonts into FONTS_DIR; None if unavailable.
+
+    Google Fonts are OFL/Apache licensed, so embedding what comes back in an
+    exported PDF is permitted. Anything else has to be dropped into FONTS_DIR
+    by the operator.
+    """
+    key = (_normalize_font_name(family), bold, italic)
+    if not FONT_DOWNLOAD_ENABLED or not family or key in _UNAVAILABLE_FAMILIES:
+        return None
+    url = _google_font_url(family, bold, italic)
+    if not url:
+        _UNAVAILABLE_FAMILIES.add(key)
+        return None
+    from urllib.request import Request, urlopen
+
+    try:
+        request = Request(url, headers={"User-Agent": "Mozilla/4.0"})
+        with urlopen(request, timeout=FONT_DOWNLOAD_TIMEOUT) as response:
+            payload = response.read()
+        pymupdf.Font(fontbuffer=payload)  # reject anything unreadable
+        FONTS_DIR.mkdir(parents=True, exist_ok=True)
+        target = FONTS_DIR / _variant_filename(family, bold, italic)
+        # Write aside then rename: readers only ever see a complete file, and
+        # the pid keeps two exports racing on the same family from sharing
+        # (and truncating) one temporary.
+        temporary = target.with_suffix(f".{os.getpid()}.part")
+        temporary.write_bytes(payload)
+        temporary.replace(target)
+        return target
+    except Exception:
+        _UNAVAILABLE_FAMILIES.add(key)
+        return None
+
+
+def resolve_family_file(
+    font_name: str, bold: bool = False, italic: bool = False
+) -> tuple[Path, str] | None:
+    """Locate the full font file for the typeface named by `font_name`.
+
+    Shared by the export and the editor preview so both render text with the
+    very same file — serving the preview a subset while the export uses the
+    complete family is what makes letters silently change typeface mid-word.
+    """
+    family, name_bold, name_italic = parse_font_name(font_name)
+    if not family:
+        return None
+    bold, italic = bold or name_bold, italic or name_italic
+    key = (_normalize_font_name(family), bold, italic)
+
+    index = font_library_index()
+    if key in index:
+        return index[key], "library"
+    downloaded = download_font(family, bold, italic)
+    if downloaded is not None:
+        return downloaded, "downloaded"
+    # Only now: an upright cut of the right family still beats a different
+    # family entirely. Checked last, because matching it earlier would mask
+    # the requested weight and stop us from ever fetching it.
+    upright = font_library_index().get((key[0], False, False))
+    return (upright, "library") if upright is not None else None
+
+
+def resolve_named_font(
+    font_name: str, bold: bool, italic: bool, text: str
+) -> tuple[pymupdf.Font, str] | None:
+    """Load the real typeface named by `font_name`, covering `text`.
+
+    Returns None whenever the result would not actually cover the text, so
+    the caller can drop to a metric look-alike rather than emit notdef boxes.
+    """
+    resolved = resolve_family_file(font_name, bold, italic)
+    if resolved is None:
+        return None
+    path, source = resolved
+    try:
+        font = pymupdf.Font(fontfile=str(path))
+    except Exception:
+        return None
+    return (font, f"{source}:{path.name}") if covers_text(font, text) else None
+
+
 def covers_text(font: pymupdf.Font, text: str) -> bool:
-    """True if the font has a real glyph for every character of the text."""
-    return all(font.has_glyph(ord(char)) != 0 for char in text if char != "\n")
+    """True if the font has a real glyph for every visible character of the text.
+
+    Whitespace is exempt: subsets routinely omit the space glyph (producers
+    emit inter-word gaps as TJ offsets instead), yet TextWriter still lays out
+    a missing space as a plain advance rather than a notdef box. Vetoing on it
+    would reject an otherwise perfect embedded font over an invisible glyph.
+    """
+    return all(font.has_glyph(ord(char)) != 0 for char in text if not char.isspace())
 
 
 def _normalize_font_name(name: str) -> str:
@@ -430,7 +877,16 @@ def find_embedded_font(
     _rank, xref, ext = min(candidates)
     if ext not in ("ttf", "otf", "cff"):
         return None  # not embedded (base-14) or an unsupported format
-    _name, _ext, _type, buffer = doc.extract_font(xref)
+    if ext == "cff":
+        try:
+            _name, _ext, _type, buffer = doc.extract_font(xref)
+        except Exception:
+            return None
+    else:
+        # ttf/otf go through the cmap-synthesizing path, so Identity-H subsets
+        # (no cmap of their own) stay reusable instead of falling back.
+        extracted = embedded_font_buffer(doc, xref)
+        buffer = extracted[0] if extracted else None
     if not buffer:
         return None
     try:
@@ -446,6 +902,14 @@ def choose_font(
     embedded = find_embedded_font(doc, page, operation.font)
     if embedded is not None and covers_text(embedded, operation.newText):
         return embedded, "embedded"
+
+    # The subset did not cover the new text — try the same typeface in full
+    # before settling for a look-alike.
+    named = resolve_named_font(
+        operation.font, operation.bold, operation.italic, operation.newText
+    )
+    if named is not None:
+        return named
 
     family, bold, italic = pick_family_and_style(
         operation.font, operation.bold, operation.italic

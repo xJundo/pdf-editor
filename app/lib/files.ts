@@ -13,6 +13,11 @@ export function versionRelativePath(userId: string, documentId: string, versionI
   return path.posix.join(userId, documentId, `${versionId}.pdf`)
 }
 
+/** Edit journal of a version, stored beside its PDF on the same volume. */
+export function journalRelativePath(userId: string, documentId: string, versionId: string) {
+  return path.posix.join(userId, documentId, `${versionId}.json`)
+}
+
 /** Absolute path for a stored file, guaranteed to stay inside FILES_ROOT. */
 export function absoluteFilePath(relativePath: string) {
   const absolute = path.resolve(FILES_ROOT, relativePath)

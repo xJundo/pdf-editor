@@ -12,7 +12,10 @@ export async function getOwnedVersion(userId: string, documentId: string, versio
       versionId: documentVersions.id,
       versionNumber: documentVersions.versionNumber,
       versionName: documentVersions.name,
+      sourceVersionId: documentVersions.sourceVersionId,
       filePath: documentVersions.filePath,
+      journalPath: documentVersions.journalPath,
+      editCount: documentVersions.editCount,
       pageCount: documentVersions.pageCount,
       documentId: documents.id,
       name: documents.name,
@@ -38,6 +41,8 @@ export async function getDocumentVersions(userId: string, documentId: string) {
       name: documentVersions.name,
       fileSize: documentVersions.fileSize,
       pageCount: documentVersions.pageCount,
+      sourceVersionId: documentVersions.sourceVersionId,
+      editCount: documentVersions.editCount,
       createdAt: documentVersions.createdAt,
     })
     .from(documentVersions)

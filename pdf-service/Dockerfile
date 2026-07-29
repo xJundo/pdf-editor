@@ -17,7 +17,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
 
-RUN mkdir -p /data/files && chown appuser /data/files
+# Both must exist and be owned here: a named volume mounted over a missing
+# directory lands root-owned, and appuser could no longer cache fonts.
+RUN mkdir -p /data/files /data/fonts && chown appuser /data/files /data/fonts
 USER appuser
 
 EXPOSE 8000

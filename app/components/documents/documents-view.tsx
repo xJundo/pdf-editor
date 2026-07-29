@@ -366,7 +366,9 @@ export function DocumentsView({ documents }: { documents: DocumentItem[] }) {
         open={versionsFor !== null}
         onOpenChange={(open) => !open && setVersionsFor(null)}
       >
-        <DialogContent>
+        {/* Widened for the same reason as the editor's version dialog: the
+            4-button action group leaves the default sm width nothing to give. */}
+        <DialogContent className="sm:max-w-2xl">
           <DialogHeader>
             <DialogTitle>Versions de « {versionsFor?.name} »</DialogTitle>
             <DialogDescription>
@@ -392,7 +394,7 @@ export function DocumentsView({ documents }: { documents: DocumentItem[] }) {
                       <Badge variant="secondary">v{version.versionNumber}</Badge>
                     ) : null}
                   </div>
-                  <span className="text-xs text-muted-foreground">
+                  <span className="truncate text-xs whitespace-nowrap text-muted-foreground">
                     {formatDate(version.createdAt)} · {formatBytes(version.fileSize)}
                     {version.pageCount !== null ? ` · ${version.pageCount} p.` : ""}
                   </span>

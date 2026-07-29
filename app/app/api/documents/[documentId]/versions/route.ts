@@ -1,12 +1,16 @@
 import { randomUUID } from "node:crypto"
-import { stat } from "node:fs/promises"
+import { stat, writeFile } from "node:fs/promises"
 
 import { desc, eq } from "drizzle-orm"
 
 import { db } from "@/db"
 import { documents, documentVersions } from "@/db/schema"
 import { getOwnedVersion } from "@/lib/documents"
-import { absoluteFilePath, versionRelativePath } from "@/lib/files"
+import {
+  absoluteFilePath,
+  journalRelativePath,
+  versionRelativePath,
+} from "@/lib/files"
 import { exportPdf, PdfServiceError } from "@/lib/pdf-service"
 import type { EditOperation } from "@/lib/pdf-structure"
 import { getSession } from "@/lib/session"
@@ -100,6 +104,7 @@ export async function POST(
   if (body.operations.length > MAX_OPERATIONS || !body.operations.every(isValidOperation)) {
     return Response.json({ error: "Journal de modifications invalide." }, { status: 400 })
   }
+  const operations: EditOperation[] = body.operations
 
   const source = await getOwnedVersion(session.user.id, documentId, body.sourceVersionId)
   if (!source) {
@@ -119,7 +124,7 @@ export async function POST(
 
   let pageCount: number
   try {
-    const result = await exportPdf(source.filePath, targetPath, body.operations)
+    const result = await exportPdf(source.filePath, targetPath, operations)
     pageCount = result.pageCount
   } catch (error) {
     if (error instanceof PdfServiceError && error.status < 500) {
@@ -132,6 +137,26 @@ export async function POST(
 
   const { size } = await stat(absoluteFilePath(targetPath))
 
+  // Keep the journal that produced this version so the user can reopen the
+  // source version with all of it restored and fix one entry, instead of
+  // redoing every edit from scratch. It lives on the volume, not in the
+  // database: replacement images travel inside it as base64.
+  const journalPath = journalRelativePath(session.user.id, documentId, versionId)
+  let storedJournalPath: string | null = journalPath
+  try {
+    await writeFile(
+      absoluteFilePath(journalPath),
+      JSON.stringify({
+        sourceVersionId: source.versionId,
+        operations,
+      })
+    )
+  } catch (error) {
+    // A failed journal write must not lose the exported PDF itself.
+    console.error("export: journal write failed", error)
+    storedJournalPath = null
+  }
+
   await db.transaction(async (tx) => {
     await tx.insert(documentVersions).values({
       id: versionId,
@@ -139,8 +164,10 @@ export async function POST(
       versionNumber: nextVersionNumber,
       sourceVersionId: source.versionId,
       filePath: targetPath,
-      fileSize: size,
+      journalPath: storedJournalPath,
+      editCount: operations.length,
       pageCount,
+      fileSize: size,
     })
     await tx
       .update(documents)

@@ -26,8 +26,14 @@ services:
     build: ./pdf-service
     environment:
       FILES_ROOT: /data/files
+      # Font library: downloaded families are cached here, and operators can
+      # drop in licensed fonts we cannot fetch. Set FONT_DOWNLOAD_ENABLED=0
+      # to keep the service fully offline (look-alike fallbacks only).
+      FONTS_DIR: /data/fonts
+      FONT_DOWNLOAD_ENABLED: ${FONT_DOWNLOAD_ENABLED:-1}
     volumes:
       - pdf_files:/data/files
+      - pdf_fonts:/data/fonts
 
   db:
     image: postgres:17-alpine
@@ -45,4 +51,5 @@ services:
 
 volumes:
   pdf_files:
+  pdf_fonts:
   pg_data:
