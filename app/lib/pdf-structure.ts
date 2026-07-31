@@ -22,6 +22,10 @@ export interface PdfSpan {
 export interface PdfFont {
   xref: number
   format: "truetype" | "opentype"
+  /** Weight/slant the program itself carries, declared on the @font-face so
+   * the browser doesn't synthesize bold/italic on top of it. */
+  bold: boolean
+  italic: boolean
 }
 
 /** Sub-region of a source image kept on export, as fractions in 0..1. */

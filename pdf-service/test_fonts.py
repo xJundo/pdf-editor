@@ -267,3 +267,65 @@ def test_whitespace_does_not_veto_coverage():
     assert font.has_glyph(ord(" ")) == 0
     assert main.covers_text(font, "A A") is True
     assert main.covers_text(font, "AB") is False
+
+
+# --- bare CFF programs ---------------------------------------------------
+
+
+def _bare_cff(width: int = 550) -> bytes:
+    """A minimal CFF program, as PDFs from InDesign & co. embed them.
+
+    Built by compiling a CFF-flavoured OpenType font and then throwing the
+    container away — which is exactly the shape `extract_font` hands back for
+    an embedded Type1/CFF font.
+    """
+    from fontTools.fontBuilder import FontBuilder
+    from fontTools.pens.t2CharStringPen import T2CharStringPen
+
+    order = [".notdef", "A", "b"]
+    charstrings = {}
+    for name in order:
+        pen = T2CharStringPen(width, None)
+        pen.moveTo((50, 0))
+        pen.lineTo((450, 0))
+        pen.lineTo((450, 700))
+        pen.closePath()
+        charstrings[name] = pen.getCharString()
+    builder = FontBuilder(1000, isTTF=False)
+    builder.setupGlyphOrder(order)
+    builder.setupCharacterMap({ord("A"): "A", ord("b"): "b"})
+    builder.setupCFF("Probe", {"FullName": "Probe"}, charstrings, {})
+    builder.setupHorizontalMetrics({name: (width, 50) for name in order})
+    builder.setupHorizontalHeader(ascent=800, descent=-200)
+    builder.setupNameTable({"familyName": "Probe", "styleName": "Regular"})
+    builder.setupOS2()
+    builder.setupPost()
+    return builder.font.getTableData("CFF ")
+
+
+def test_bare_cff_is_wrapped_into_a_usable_opentype():
+    """A naked CFF is unusable in a browser; PyMuPDF reads it either way.
+
+    Left unwrapped, the preview silently drops to a system look-alike while
+    the export keeps the document's real typeface — the exact preview/export
+    mismatch this pipeline exists to prevent.
+    """
+    wrapped = main.cff_to_otf(_bare_cff(), "ABCDEF+Probe")
+    assert wrapped is not None
+    assert wrapped[:4] == b"OTTO"
+
+    font = TTFont(io.BytesIO(wrapped))
+    # Addressable by character, with the CFF's own metrics preserved.
+    assert font["cmap"].getBestCmap()[ord("A")] == "A"
+    assert font["hmtx"]["A"][0] == 550
+    # And loadable by the renderer the export uses.
+    assert pymupdf.Font(fontbuffer=wrapped).has_glyph(ord("A")) != 0
+
+
+def test_subset_prefix_is_stripped_from_the_wrapped_family():
+    font = TTFont(io.BytesIO(main.cff_to_otf(_bare_cff(), "ABCDEF+Probe")))
+    assert "ABCDEF+" not in font["name"].getDebugName(1)
+
+
+def test_unparseable_cff_yields_nothing():
+    assert main.cff_to_otf(b"not a font", "X") is None

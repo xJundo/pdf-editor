@@ -17,6 +17,10 @@ from typing import Annotated, Literal
 
 import pymupdf
 from fastapi import FastAPI, HTTPException, Response
+from fontTools import agl
+from fontTools.cffLib import CFFFontSet
+from fontTools.fontBuilder import FontBuilder
+from fontTools.pens.boundsPen import BoundsPen
 from fontTools.ttLib import TTFont, newTable
 from fontTools.ttLib.tables._c_m_a_p import CmapSubtable
 from pydantic import BaseModel, Field
@@ -277,6 +281,79 @@ def _maps_code_to_glyph_id(doc: pymupdf.Document, xref: int) -> bool:
     return cid_to_gid[0] == "null" or cid_to_gid[1] == "/Identity"
 
 
+def cff_to_otf(buffer: bytes, basefont: str) -> bytes | None:
+    """Wrap a bare CFF font program in an OpenType container.
+
+    PDFs from InDesign & co. embed PostScript outlines as a naked CFF table.
+    PyMuPDF (FreeType) reads that directly, so the *export* reuses the real
+    typeface — but no browser does: a font must be an sfnt. Without this the
+    editor preview silently drops to a system look-alike while the export keeps
+    the original, which is exactly the preview/export mismatch to avoid.
+
+    The character map is rebuilt from the CFF's own PostScript glyph names via
+    the Adobe Glyph List, and the metrics from its charstrings.
+    """
+    try:
+        fontset = CFFFontSet()
+        fontset.decompile(io.BytesIO(buffer), None)
+        top = fontset[fontset.fontNames[0]]
+        # FontMatrix is 1/upem on the diagonal; PostScript fonts use 1000.
+        upem = round(1 / top.FontMatrix[0]) if top.FontMatrix[0] else 1000
+        order = [name for name in top.charset if name != ".notdef"]
+        order.insert(0, ".notdef")
+
+        charstrings = {}
+        metrics = {}
+        for name in order:
+            charstring = top.CharStrings[name]
+            pen = BoundsPen(None)
+            charstring.draw(pen)  # also resolves the charstring's own width
+            width = charstring.width
+            if width is None:
+                width = getattr(top.Private, "defaultWidthX", 0)
+            metrics[name] = (round(width), round(pen.bounds[0]) if pen.bounds else 0)
+            charstrings[name] = charstring
+
+        cmap: dict[int, str] = {}
+        for name in order:
+            text = agl.toUnicode(name)
+            if len(text) == 1 and ord(text) not in cmap:
+                cmap[ord(text)] = name
+        if not cmap:
+            return None  # nothing addressable by character: useless as a preview
+
+        family = basefont.split("+")[-1] or "PdfFont"
+        _x0, y0, _x1, y1 = top.FontBBox
+        builder = FontBuilder(upem, isTTF=False)
+        builder.setupGlyphOrder(order)
+        builder.setupCharacterMap(cmap)
+        builder.setupCFF(family, {"FullName": family}, charstrings, {})
+        builder.setupHorizontalMetrics(metrics)
+        builder.setupHorizontalHeader(ascent=round(y1), descent=round(y0))
+        builder.setupNameTable(
+            {
+                "familyName": family,
+                "styleName": "Regular",
+                "psName": family,
+                "fullName": family,
+                "version": "1.0",
+                "uniqueFontIdentifier": basefont,
+            }
+        )
+        builder.setupOS2(
+            sTypoAscender=round(y1),
+            sTypoDescender=round(y0),
+            usWinAscent=round(y1),
+            usWinDescent=abs(round(y0)),
+        )
+        builder.setupPost()
+        out = io.BytesIO()
+        builder.save(out)
+        return out.getvalue()
+    except Exception:
+        return None
+
+
 def embedded_font_buffer(doc: pymupdf.Document, xref: int) -> tuple[bytes, str] | None:
     """Extract a font program, adding a unicode cmap when it lacks one.
 
@@ -284,10 +361,15 @@ def embedded_font_buffer(doc: pymupdf.Document, xref: int) -> tuple[bytes, str] 
     supported format, or cannot be made unicode-addressable.
     """
     try:
-        _name, ext, _type, buffer = doc.extract_font(xref)
+        name, ext, _type, buffer = doc.extract_font(xref)
     except Exception:
         return None
-    if not buffer or ext not in ("ttf", "otf"):
+    if not buffer:
+        return None
+    if ext == "cff":
+        wrapped = cff_to_otf(buffer, name)
+        return (wrapped, "otf") if wrapped else None
+    if ext not in ("ttf", "otf"):
         return None
     if _font_has_unicode_cmap(buffer):
         return buffer, ext
@@ -306,21 +388,33 @@ def embedded_font_buffer(doc: pymupdf.Document, xref: int) -> tuple[bytes, str] 
 
 def page_preview_fonts(
     doc: pymupdf.Document, page: pymupdf.Page
-) -> dict[str, tuple[int, str]]:
-    """Map normalized embedded font names to (xref, css-format) for the preview.
+) -> dict[str, tuple[int, str, bool, bool]]:
+    """Map normalized embedded font names to (xref, css-format, bold, italic).
 
-    Only ttf/otf programs the browser can address by character are offered —
-    either they already carry a unicode cmap, or one is synthesized from the
-    font's ToUnicode map (see embedded_font_buffer).
+    Only programs the browser can address by character are offered: ttf/otf that
+    carry a unicode cmap (or get one synthesized from their ToUnicode map), and
+    bare CFF wrapped into an OpenType container — see `embedded_font_buffer`.
+    The ext filter also keeps non-embedded base-14 fonts out of the family
+    lookup in `preview_font_buffer`, which can reach the network.
     """
-    result: dict[str, tuple[int, str]] = {}
+    result: dict[str, tuple[int, str, bool, bool]] = {}
     for entry in page.get_fonts(full=True):
         xref, ext, basefont = entry[0], entry[1], entry[3]
-        if ext not in ("ttf", "otf") or preview_font_buffer(doc, xref) is None:
+        if ext not in ("ttf", "otf", "cff"):
             continue
+        extracted = preview_font_buffer(doc, xref)
+        if extracted is None:
+            continue
+        # The served format is what the buffer actually is, not what the PDF
+        # embedded: a wrapped CFF ships as OpenType, and a resolved family file
+        # may differ from the document's own program.
+        _buffer, served = extracted
+        _family, bold, italic = parse_font_name(basefont)
         result[_normalize_font_name(basefont)] = (
             xref,
-            "truetype" if ext == "ttf" else "opentype",
+            "truetype" if served == "ttf" else "opentype",
+            bold,
+            italic,
         )
     return result
 
@@ -357,21 +451,22 @@ def document_structure(path: str) -> dict:
             if not doc.is_pdf:
                 raise HTTPException(status_code=422, detail="not a PDF")
             pages = []
-            preview_fonts: dict[int, str] = {}  # xref -> css format, doc-wide
+            # xref -> (css format, bold, italic), doc-wide
+            preview_fonts: dict[int, tuple[str, bool, bool]] = {}
             for page_index, page in enumerate(doc):
                 spans = []
                 # Embedded fonts of this page usable as @font-face previews.
                 page_fonts = page_preview_fonts(doc, page)
-                for xref, fmt in page_fonts.values():
-                    preview_fonts[xref] = fmt
+                for xref, fmt, bold, italic in page_fonts.values():
+                    preview_fonts[xref] = (fmt, bold, italic)
 
                 def match_preview_font(font_name: str) -> int | None:
                     target = _normalize_font_name(font_name)
                     if target in page_fonts:
                         return page_fonts[target][0]
-                    for name, (xref, _fmt) in page_fonts.items():
+                    for name, entry in page_fonts.items():
                         if name.startswith(target) or target.startswith(name):
-                            return xref
+                            return entry[0]
                     return None
 
                 text = page.get_text("dict")
@@ -433,8 +528,12 @@ def document_structure(path: str) -> dict:
                         "images": images,
                     }
                 )
+            # bold/italic ride along so the editor can declare them on the
+            # @font-face: a bold-only program registered as a regular face gets
+            # the browser's synthetic bold piled on top of it.
             fonts = [
-                {"xref": xref, "format": fmt} for xref, fmt in preview_fonts.items()
+                {"xref": xref, "format": fmt, "bold": bold, "italic": italic}
+                for xref, (fmt, bold, italic) in preview_fonts.items()
             ]
             return {"pageCount": doc.page_count, "pages": pages, "fonts": fonts}
     except pymupdf.FileDataError as exc:
@@ -1029,6 +1128,89 @@ def _place_image(
         page.insert_image(rect, stream=data, keep_proportion=False)
 
 
+# A neighbouring span belongs to another line — and must survive the redaction —
+# when its vertical centre sits at least this share of the edited box height away
+# from the edited span's centre. Closer than that they are words of the same
+# line, whose bboxes overlap ours completely; only the horizontal inset separates
+# those.
+_NEIGHBOUR_LINE_RATIO = 0.25
+# Horizontal overlap (points) below which a neighbour is considered to sit beside
+# the edited span rather than above/below it.
+_NEIGHBOUR_OVERLAP_PT = 1.0
+# Slight inset of the redaction rect, so it never clips glyphs of the adjacent
+# word on the same line.
+_REDACT_INSET_PT = 0.5
+
+
+def page_span_boxes(page: pymupdf.Page) -> list[tuple[str, pymupdf.Rect]]:
+    """(spanId, bbox) of every text span of the page, ids as in extraction."""
+    boxes: list[tuple[str, pymupdf.Rect]] = []
+    for block_index, block in enumerate(page.get_text("dict")["blocks"]):
+        if block["type"] != 0:
+            continue
+        for line_index, line in enumerate(block["lines"]):
+            for span_index, span in enumerate(line["spans"]):
+                if not span["text"].strip():
+                    continue
+                boxes.append(
+                    (
+                        f"p{page.number}-b{block_index}-l{line_index}-s{span_index}",
+                        pymupdf.Rect(span["bbox"]),
+                    )
+                )
+    return boxes
+
+
+def redaction_rect(
+    bbox: tuple[float, float, float, float],
+    neighbours: list[pymupdf.Rect],
+) -> pymupdf.Rect | None:
+    """The rect to redact for an edited span, clipped off neighbouring lines.
+
+    MuPDF removes every glyph whose bbox *intersects* a redaction rect, and span
+    bboxes are font-metric boxes (ascender to descender): tightly leaded lines
+    therefore overlap each other vertically. Redacting the raw bbox of a title
+    line silently deletes the lines above and below it — real bug, seen on a
+    55 pt title with 49 pt leading where editing one line wiped two others.
+
+    Since removal is by intersection, a thin horizontal band inside the span
+    still erases all of its glyphs. So we keep only the part of the box that no
+    neighbouring line reaches. Returns None when the box is degenerate.
+    """
+    rect = pymupdf.Rect(*bbox) + (
+        _REDACT_INSET_PT,
+        _REDACT_INSET_PT,
+        -_REDACT_INSET_PT,
+        -_REDACT_INSET_PT,
+    )
+    if rect.is_empty:
+        return None
+
+    height = rect.y1 - rect.y0
+    centre = (rect.y0 + rect.y1) / 2
+    top, bottom = rect.y0, rect.y1
+    for other in neighbours:
+        overlap = min(rect.x1, other.x1) - max(rect.x0, other.x0)
+        if overlap <= _NEIGHBOUR_OVERLAP_PT:
+            continue  # beside us, not above or below
+        if other.y1 <= rect.y0 or other.y0 >= rect.y1:
+            continue  # no vertical conflict
+        other_centre = (other.y0 + other.y1) / 2
+        if abs(other_centre - centre) < _NEIGHBOUR_LINE_RATIO * height:
+            continue  # same line as us
+        if other_centre < centre:
+            top = max(top, other.y1)
+        else:
+            bottom = min(bottom, other.y0)
+
+    if bottom - top <= 0:
+        # Neighbours cover the whole box: no band can spare them, so fall back
+        # to the plain box rather than skipping the edit altogether.
+        return rect
+    rect.y0, rect.y1 = top, bottom
+    return None if rect.is_empty else rect
+
+
 def delete_signature_fields(doc: pymupdf.Document) -> int:
     """Drop signature form fields — edited exports never preserve signatures."""
     deleted = 0
@@ -1095,13 +1277,20 @@ def export_document(request: ExportRequest) -> dict:
                     strategy += ":resized"
                 font_strategies[operation.spanId] = strategy
                 insertions.append((operation, font, size))
+            # Spans left untouched must survive the redaction even when their
+            # bbox overlaps an edited one (tight leading). Edited spans are
+            # excluded: their originals are redacted and reinserted anyway.
+            edited_ids = {operation.spanId for operation in operations}
+            neighbours = [
+                box
+                for span_id, box in page_span_boxes(page)
+                if span_id not in edited_ids
+            ]
             # Redact all edited spans first, then reinsert, so an inserted
             # text is never wiped by a later redaction on the same page.
             for operation in operations:
-                rect = pymupdf.Rect(*operation.bbox)
-                # Slight inset to avoid clipping glyphs of adjacent spans.
-                rect = rect + (0.5, 0.5, -0.5, -0.5)
-                if not rect.is_empty:
+                rect = redaction_rect(operation.bbox, neighbours)
+                if rect is not None:
                     page.add_redact_annot(rect)
             page.apply_redactions(
                 images=pymupdf.PDF_REDACT_IMAGE_NONE,

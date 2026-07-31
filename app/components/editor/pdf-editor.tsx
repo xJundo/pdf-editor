@@ -52,6 +52,11 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Separator } from "@/components/ui/separator"
+import {
+  Progress,
+  ProgressLabel,
+  ProgressValue,
+} from "@/components/ui/progress"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
 import { toast } from "@/components/ui/toast"
@@ -158,11 +163,34 @@ function spanBackdrop(color: string): string {
   return colorLightness(color) > 0.6 ? "#27272a" : "#ffffff"
 }
 
+/**
+ * Vertical extent of a span's real glyph ink, as a share of the font size.
+ *
+ * A PyMuPDF span bbox runs from the font's ascender to its descender, which is
+ * taller than the glyphs ever reach: on tightly leaded text (a 55 pt title on
+ * 49 pt leading) consecutive boxes overlap, so painting a full-box backdrop
+ * clips the line above and below. Covering only the ink band leaves the
+ * neighbours untouched.
+ */
+const INK_ASCENT = 0.82
+const INK_DESCENT = 0.22
+
+/** The band of a span box that its glyphs actually cover, in PDF points. */
+function inkBand(
+  bbox: BBox,
+  origin: [number, number],
+  size: number
+): [number, number] {
+  const top = Math.max(bbox[1], origin[1] - INK_ASCENT * size)
+  const bottom = Math.min(bbox[3], origin[1] + INK_DESCENT * size)
+  return bottom > top ? [top, bottom] : [bbox[1], bbox[3]]
+}
+
 function toHex(r: number, g: number, b: number): string {
   return `#${[r, g, b].map((c) => c.toString(16).padStart(2, "0")).join("")}`
 }
 
-/** Ring width around a span box, in PDF points, sampled for its backdrop. */
+/** Ring width around the ink band, in PDF points, sampled for its backdrop. */
 const BACKDROP_RING_PT = 2
 /** Share of ring pixels one colour must reach to count as "the background". */
 const BACKDROP_DOMINANCE = 0.55
@@ -170,22 +198,27 @@ const BACKDROP_DOMINANCE = 0.55
 /**
  * The colour actually painted around a span on the pdf.js canvas.
  *
- * A white title on a blue banner used to get the dark fallback backdrop, which
- * reads as a black box over the page. Sampling the ring just outside the span
- * box returns the real page colour there (blue), so the overlay disappears into
- * the page. Returns null when no single colour dominates the ring (the span
- * sits on mixed content) — the caller then falls back to `spanBackdrop`.
+ * A flat colour it is: rebuilding the page texture behind the span (sampling it
+ * column by column and stretching it back) tracked gradients faithfully but
+ * looked cheap, so the backdrop stays one solid colour. A fixed one won't do
+ * either — a white title on a blue banner got the dark contrast fallback, which
+ * reads as a black box — so sample the ring just outside the ink band: on flat
+ * content it returns exactly the page colour there. When no single colour
+ * dominates (the span sits on a photo) fall back to the ring's median, still a
+ * real colour of the page rather than an arbitrary black or white. Returns null
+ * only when the canvas can't be read at all.
  */
 function sampleBackdrop(
   data: ImageData,
   bbox: BBox,
+  band: [number, number],
   pxPerPoint: number
 ): string | null {
   const ring = BACKDROP_RING_PT * pxPerPoint
   const x0 = bbox[0] * pxPerPoint - ring
-  const y0 = bbox[1] * pxPerPoint - ring
   const x1 = bbox[2] * pxPerPoint + ring
-  const y1 = bbox[3] * pxPerPoint + ring
+  const y0 = band[0] * pxPerPoint - ring
+  const y1 = band[1] * pxPerPoint + ring
   const steps = 16
   const points: [number, number][] = []
   for (let i = 0; i <= steps; i++) {
@@ -196,7 +229,7 @@ function sampleBackdrop(
 
   // Bucket by 5-bit channels so anti-aliasing noise doesn't split the mode.
   const counts = new Map<number, { n: number; r: number; g: number; b: number }>()
-  let total = 0
+  const channels: [number[], number[], number[]] = [[], [], []]
   for (const [px, py] of points) {
     const x = Math.round(px)
     const y = Math.round(py)
@@ -212,20 +245,29 @@ function sampleBackdrop(
     bucket.g += g
     bucket.b += b
     counts.set(key, bucket)
-    total++
+    channels[0].push(r)
+    channels[1].push(g)
+    channels[2].push(b)
   }
+  const total = channels[0].length
   if (total === 0) return null
 
   let best: { n: number; r: number; g: number; b: number } | null = null
   for (const bucket of counts.values()) {
     if (!best || bucket.n > best.n) best = bucket
   }
-  if (!best || best.n / total < BACKDROP_DOMINANCE) return null
-  return toHex(
-    Math.round(best.r / best.n),
-    Math.round(best.g / best.n),
-    Math.round(best.b / best.n)
-  )
+  if (best && best.n / total >= BACKDROP_DOMINANCE) {
+    return toHex(
+      Math.round(best.r / best.n),
+      Math.round(best.g / best.n),
+      Math.round(best.b / best.n)
+    )
+  }
+  // Median per channel: robust to the few glyph pixels of a neighbouring line
+  // that inevitably fall in the ring.
+  const median = (values: number[]) =>
+    values.sort((a, b) => a - b)[values.length >> 1]
+  return toHex(median(channels[0]), median(channels[1]), median(channels[2]))
 }
 
 // --- Geometry helpers (PDF points, top-left origin) ----------------------
@@ -361,6 +403,11 @@ export function PdfEditor({
   const router = useRouter()
   const [pdfDoc, setPdfDoc] = useState<PDFDocumentProxy | null>(null)
   const [loadError, setLoadError] = useState(false)
+  // Bytes fetched by pdf.js so far; total is 0 until the server's length is known.
+  const [loadProgress, setLoadProgress] = useState<{
+    loaded: number
+    total: number
+  } | null>(null)
   const [selection, setSelection] = useState<Selection | null>(null)
   const [edits, setEdits] = useState<Record<string, string>>({})
   const [spanBoxes, setSpanBoxes] = useState<Record<string, SpanBox>>({})
@@ -419,7 +466,13 @@ export function PdfEditor({
           (f) =>
             `@font-face{font-family:"pdffont-${f.xref}";` +
             `src:url("/api/documents/${documentId}/versions/${versionId}/fonts/${f.xref}") ` +
-            `format("${f.format}");font-display:swap;}`
+            `format("${f.format}");` +
+            // Declared, not left to default: a bold-only program registered as
+            // a 400 face gets synthetic bold piled on top when the span asks
+            // for 700, which reads noticeably heavier than the original.
+            `font-weight:${f.bold ? 700 : 400};` +
+            `font-style:${f.italic ? "italic" : "normal"};` +
+            `font-display:swap;}`
         )
         .join("\n"),
     [structure.fonts, documentId, versionId]
@@ -458,6 +511,13 @@ export function PdfEditor({
         // by scripts/copy-pdfjs-assets.mjs — without them pdf.js silently
         // drops ICC/JPX/JBIG2 images.
         const task = pdfjs.getDocument({ url: fileUrl, wasmUrl: "/pdfjs/wasm/" })
+        // A 15 MB document takes seconds to arrive: report the download so the
+        // editor shows how far along it is instead of a mute skeleton. `total`
+        // is 0 when the response isn't length-delimited — then we only know the
+        // bytes received, not the ratio.
+        task.onProgress = ({ loaded, total }: { loaded: number; total: number }) => {
+          if (!cancelled) setLoadProgress({ loaded, total })
+        }
         loadingTask = task
         const doc = await task.promise
         if (!cancelled) setPdfDoc(doc)
@@ -985,6 +1045,7 @@ export function PdfEditor({
       ) : (
         <div className="flex items-start gap-6">
           <div className="min-w-0 flex-1 overflow-x-auto">
+            {pdfDoc ? null : <PdfLoadingProgress progress={loadProgress} />}
             <div className="w-max min-w-full mx-auto flex flex-col items-center gap-6 p-4">
               {structure.pages.map((page) => (
                 <PdfPageView
@@ -1095,6 +1156,34 @@ export function PdfEditor({
   )
 }
 
+/** Download progress of the PDF itself, shown until pdf.js can render pages. */
+function PdfLoadingProgress({
+  progress,
+}: {
+  progress: { loaded: number; total: number } | null
+}) {
+  const loaded = progress?.loaded ?? 0
+  const total = progress?.total ?? 0
+  // A response without Content-Length gives no ratio: run the bar
+  // indeterminate rather than invent a percentage.
+  const ratio = total > 0 ? Math.min(100, Math.round((loaded / total) * 100)) : null
+
+  return (
+    <div className="mx-auto w-full max-w-md px-4 pt-4" role="status" aria-live="polite">
+      <Progress value={ratio}>
+        <ProgressLabel>Chargement du document…</ProgressLabel>
+        <ProgressValue>
+          {() =>
+            total > 0
+              ? `${formatBytes(loaded)} / ${formatBytes(total)}`
+              : formatBytes(loaded)
+          }
+        </ProgressValue>
+      </Progress>
+    </div>
+  )
+}
+
 function PdfPageView({
   pdfDoc,
   page,
@@ -1136,12 +1225,16 @@ function PdfPageView({
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const wrapperRef = useRef<HTMLDivElement>(null)
-  const [rendered, setRendered] = useState(false)
+  // Bumped after every successful canvas paint, not a plain "done" flag: the
+  // backdrops are read off the canvas, so they must be probed again each time
+  // it is repainted (zoom, or a layout change resizing the page).
+  const [renderCount, setRenderCount] = useState(0)
+  const rendered = renderCount > 0
   const [pxWidth, setPxWidth] = useState(0)
-  // Page colour behind each span, read once from the painted canvas. Zoom
-  // does not change it, so it is sampled on the first render only.
+  // Page colour behind each edited span, keyed by span id. Sampled off the
+  // painted canvas, only for the spans that need one — reading pixels for
+  // every span of every page would be wasted work.
   const [backdrops, setBackdrops] = useState<Record<string, string>>({})
-  const sampledRef = useRef(false)
 
   useEffect(() => {
     const wrapper = wrapperRef.current
@@ -1174,7 +1267,7 @@ function PdfPageView({
       renderTask = pdfPage.render({ canvas, viewport })
       try {
         await renderTask.promise
-        if (!cancelled) setRendered(true)
+        if (!cancelled) setRenderCount((count) => count + 1)
       } catch {
         // Render cancelled on unmount: nothing to do.
       }
@@ -1185,33 +1278,6 @@ function PdfPageView({
       renderTask?.cancel()
     }
   }, [pdfDoc, page.number, pxWidth, zoom, page.width])
-
-  useEffect(() => {
-    if (!rendered || sampledRef.current) return
-    // Read after paint: the canvas is the external source of truth here.
-    const frame = requestAnimationFrame(() => {
-      const canvas = canvasRef.current
-      if (!canvas || canvas.width === 0) return
-      const context = canvas.getContext("2d", { willReadFrequently: false })
-      if (!context) return
-      sampledRef.current = true
-      let data: ImageData
-      try {
-        data = context.getImageData(0, 0, canvas.width, canvas.height)
-      } catch {
-        // Tainted canvas: keep the contrast-based fallback.
-        return
-      }
-      const pxPerPoint = canvas.width / page.width
-      const sampled: Record<string, string> = {}
-      for (const span of page.spans) {
-        const color = sampleBackdrop(data, span.bbox, pxPerPoint)
-        if (color) sampled[span.id] = color
-      }
-      setBackdrops(sampled)
-    })
-    return () => cancelAnimationFrame(frame)
-  }, [rendered, page.spans, page.width])
 
   // Display scale: CSS px per PDF point, for font sizing in overlays.
   const scale = pxWidth > 0 ? pxWidth / page.width : 0
@@ -1225,7 +1291,57 @@ function PdfPageView({
     }
   }
 
-  function spanTextStyle(size: number, bbox: BBox, span: PdfSpan): React.CSSProperties {
+  // Only a span whose glyphs are being replaced needs its background rebuilt.
+  const backdropTargets = page.spans
+    .filter((span) => span.id in edits || span.id === editingId)
+    .map((span) => ({ id: span.id, ...effectiveSpan(span) }))
+  // Geometry is part of the key: resizing a box moves the ink band, so the
+  // colour has to be sampled again around its new place.
+  const backdropKey = backdropTargets
+    .map((t) => `${t.id}:${t.bbox.join()}:${t.origin.join()}:${t.size}`)
+    .join("|")
+
+  useEffect(() => {
+    if (!rendered || backdropTargets.length === 0) return
+    // Read after paint: the canvas is the external source of truth here.
+    const frame = requestAnimationFrame(() => {
+      const canvas = canvasRef.current
+      if (!canvas || canvas.width === 0) return
+      const context = canvas.getContext("2d", { willReadFrequently: false })
+      if (!context) return
+      let data: ImageData
+      try {
+        data = context.getImageData(0, 0, canvas.width, canvas.height)
+      } catch {
+        // Tainted canvas: keep the contrast-based fallback.
+        return
+      }
+      const pxPerPoint = canvas.width / page.width
+      const sampled: Record<string, string> = {}
+      for (const target of backdropTargets) {
+        const color = sampleBackdrop(
+          data,
+          target.bbox,
+          inkBand(target.bbox, target.origin, target.size),
+          pxPerPoint
+        )
+        if (color) sampled[target.id] = color
+      }
+      setBackdrops(sampled)
+    })
+    return () => cancelAnimationFrame(frame)
+    // backdropKey stands for backdropTargets, which is rebuilt every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [renderCount, backdropKey, page.width])
+
+  function spanTextStyle(
+    size: number,
+    bbox: BBox,
+    origin: [number, number],
+    span: PdfSpan
+  ): React.CSSProperties {
+    const [top, bottom] = inkBand(bbox, origin, size)
+    const color = backdrops[span.id] ?? spanBackdrop(span.color)
     return {
       fontSize: size * scale,
       lineHeight: `${(bbox[3] - bbox[1]) * scale}px`,
@@ -1233,7 +1349,12 @@ function PdfPageView({
       fontWeight: span.bold ? 700 : 400,
       fontStyle: span.italic ? "italic" : "normal",
       color: span.color,
-      backgroundColor: backdrops[span.id] ?? spanBackdrop(span.color),
+      // Backdrop restricted to the ink band, so the rest of the box stays
+      // transparent and the neighbouring lines show through untouched.
+      backgroundImage: `linear-gradient(${color}, ${color})`,
+      backgroundSize: `100% ${(bottom - top) * scale}px`,
+      backgroundPosition: `0 ${(top - bbox[1]) * scale}px`,
+      backgroundRepeat: "no-repeat",
     }
   }
 
@@ -1280,7 +1401,7 @@ function PdfPageView({
                 initialValue={effectiveText}
                 style={{
                   ...bboxToPercent(eff.bbox, page.width, page.height),
-                  ...spanTextStyle(eff.size, eff.bbox, span),
+                  ...spanTextStyle(eff.size, eff.bbox, eff.origin, span),
                 }}
                 onCommit={onCommitEdit}
                 onCancel={onCancelEdit}
@@ -1317,7 +1438,7 @@ function PdfPageView({
               )}
               style={{
                 ...bboxToPercent(eff.bbox, page.width, page.height),
-                ...(edited && scale > 0 ? spanTextStyle(eff.size, eff.bbox, span) : {}),
+                ...(edited && scale > 0 ? spanTextStyle(eff.size, eff.bbox, eff.origin, span) : {}),
               }}
               onClick={() => {
                 onSelect({ pageIndex: page.number, type: "span", id: span.id })
@@ -1579,7 +1700,10 @@ function SpanEditor({
       ref={inputRef}
       value={draft}
       aria-label="Modifier le texte"
-      className="absolute z-10 min-w-24 rounded-xs p-0 ring-2 ring-primary outline-none"
+      // bg-transparent: the backdrop comes from the band-limited background
+      // image in `style`; the input's own field colour would paint a box over
+      // the neighbouring lines.
+      className="absolute z-10 min-w-24 rounded-xs bg-transparent p-0 ring-2 ring-primary outline-none"
       style={style}
       onChange={(event) => setDraft(event.target.value)}
       onBlur={() => onCommit(span, draft)}
