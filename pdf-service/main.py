@@ -230,6 +230,43 @@ def _ensure_post_table(tt: TTFont) -> None:
     tt["post"] = post
 
 
+def _sfnt_tables_misaligned(buffer: bytes) -> bool:
+    """True if a table offset breaks the 4-byte alignment browsers require."""
+    if len(buffer) < 12:
+        return False
+    num_tables = int.from_bytes(buffer[4:6], "big")
+    if len(buffer) < 12 + 16 * num_tables:
+        return False
+    return any(
+        int.from_bytes(buffer[12 + 16 * i + 8 : 12 + 16 * i + 12], "big") % 4
+        for i in range(num_tables)
+    )
+
+
+def sanitized_for_browser(buffer: bytes) -> bytes:
+    """Repack a font program so the browsers' OpenType sanitizer accepts it.
+
+    PDF subsetters pack sfnt tables back to back to save space; OTS rejects any
+    font whose table offsets are not 4-byte aligned. The @font-face then fails
+    with a bare "Invalid font data in ArrayBuffer" — and the editor silently
+    falls back to `cssFontFamily` — while the export renders the very same
+    program correctly, FreeType being tolerant of the packing. Rewriting
+    through fontTools restores the padding without touching the glyphs.
+
+    Only misaligned programs are rewritten: a re-save is not free, and this is
+    the one defect known to make an otherwise sound font unusable in a browser.
+    """
+    if not _sfnt_tables_misaligned(buffer):
+        return buffer
+    try:
+        tt = TTFont(io.BytesIO(buffer), fontNumber=0)
+        out = io.BytesIO()
+        tt.save(out)
+        return out.getvalue()
+    except Exception:
+        return buffer
+
+
 def preview_font_buffer(doc: pymupdf.Document, xref: int) -> tuple[bytes, str] | None:
     """Font program to expose to the editor as @font-face, or None.
 
@@ -431,7 +468,7 @@ def document_font(path: str, xref: int) -> Response:
             raise HTTPException(status_code=404, detail="font not extractable")
         buffer, ext = extracted
         media = "font/ttf" if ext == "ttf" else "font/otf"
-        return Response(content=buffer, media_type=media)
+        return Response(content=sanitized_for_browser(buffer), media_type=media)
 
 
 @app.get("/documents/structure")

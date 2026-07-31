@@ -143,6 +143,63 @@ function spanFontFamily(span: PdfSpan): string {
   return span.fontFile != null ? `"pdffont-${span.fontFile}", ${fallback}` : fallback
 }
 
+// Both mirror pdf-service/main.py; keep the two sides in sync.
+const PAGE_RIGHT_MARGIN = 36
+const MIN_FITTED_FONTSIZE = 6
+
+// One reused canvas: measuring is done on every keystroke of an inline edit.
+let measureCanvas: HTMLCanvasElement | null = null
+
+/** Metrics of `text` in PDF points: sizing the font in `size` px measures points. */
+function measureText(text: string, span: PdfSpan, size: number): TextMetrics | null {
+  if (typeof document === "undefined") return null
+  measureCanvas ??= document.createElement("canvas")
+  const context = measureCanvas.getContext("2d")
+  if (!context) return null
+  context.font = `${span.italic ? "italic " : ""}${span.bold ? 700 : 400} ${size}px ${spanFontFamily(span)}`
+  return context.measureText(text)
+}
+
+function measureTextWidth(text: string, span: PdfSpan, size: number): number {
+  return measureText(text, span, size)?.width ?? 0
+}
+
+/**
+ * Room the export gives edited text, and the size it shrinks to — mirror of
+ * `fitted_fontsize` in pdf-service/main.py.
+ *
+ * Without a manual resize the text may grow past its original box up to the
+ * page right margin at full size, and is only shrunk beyond that (never below
+ * MIN_FITTED_FONTSIZE, past which the export lets it overflow). A box the user
+ * resized by hand wins over that auto-growth: its own width is the limit.
+ */
+function fitPreview(
+  text: string,
+  span: PdfSpan,
+  bbox: BBox,
+  origin: [number, number],
+  size: number,
+  boxResized: boolean,
+  pageWidth: number
+): { size: number; width: number } {
+  const boxWidth = bbox[2] - bbox[0]
+  const available = boxResized
+    ? boxWidth
+    : Math.max(boxWidth, pageWidth - PAGE_RIGHT_MARGIN - origin[0])
+  if (available <= 0) return { size, width: boxWidth }
+  const width = measureTextWidth(text, span, size)
+  const fitted =
+    width <= available ? size : Math.max((size * available) / width, MIN_FITTED_FONTSIZE)
+  // The frame grows with the text but never shrinks below the original box:
+  // the box is also the redaction rect at export, and a narrower one would
+  // stop intersecting the tail glyphs of the original text, leaving them on
+  // the page. Deleting characters therefore leaves the frame as it was.
+  return {
+    size: fitted,
+    width: Math.min(available, Math.max(boxWidth, (width * fitted) / size)),
+  }
+}
+
 /** Perceived lightness of a #rrggbb color, 0 (black) to 1 (white). */
 function colorLightness(hex: string): number {
   const value = Number.parseInt(hex.replace("#", ""), 16)
@@ -175,15 +232,39 @@ function spanBackdrop(color: string): string {
 const INK_ASCENT = 0.82
 const INK_DESCENT = 0.22
 
-/** The band of a span box that its glyphs actually cover, in PDF points. */
+/**
+ * The band of a span box that its glyphs actually cover, in PDF points.
+ *
+ * `ink` are the measured ascent/descent of the text being covered, when
+ * available: the constants above underestimate a display face whose caps reach
+ * past 0.82 em, which used to go unnoticed because the preview replaced the
+ * glyphs at their own size — a preview shrunk to fit no longer covers them and
+ * the originals show above the band.
+ */
 function inkBand(
   bbox: BBox,
   origin: [number, number],
-  size: number
+  size: number,
+  ink?: { ascent: number; descent: number } | null
 ): [number, number] {
-  const top = Math.max(bbox[1], origin[1] - INK_ASCENT * size)
-  const bottom = Math.min(bbox[3], origin[1] + INK_DESCENT * size)
+  const ascent = ink ? Math.max(ink.ascent, INK_ASCENT * size) : INK_ASCENT * size
+  const descent = ink ? Math.max(ink.descent, INK_DESCENT * size) : INK_DESCENT * size
+  const top = Math.max(bbox[1], origin[1] - ascent)
+  const bottom = Math.min(bbox[3], origin[1] + descent)
   return bottom > top ? [top, bottom] : [bbox[1], bbox[3]]
+}
+
+/** Measured ink reach of `text` above and below its baseline, in PDF points. */
+function inkExtent(
+  text: string,
+  span: PdfSpan,
+  size: number
+): { ascent: number; descent: number } | null {
+  const metrics = measureText(text, span, size)
+  if (!metrics) return null
+  const { actualBoundingBoxAscent: ascent, actualBoundingBoxDescent: descent } = metrics
+  if (!Number.isFinite(ascent) || !Number.isFinite(descent)) return null
+  return { ascent, descent }
 }
 
 function toHex(r: number, g: number, b: number): string {
@@ -483,11 +564,28 @@ export function PdfEditor({
   useEffect(() => {
     if (structure.fonts.length === 0) return
     let cancelled = false
-    const families = structure.fonts.map((f) => `16px "pdffont-${f.xref}"`)
+    // allSettled, not all: a face the browser's sanitizer refuses rejects with
+    // a bare "NetworkError: A network error occurred.", which `all` propagates
+    // out of the chain as an unhandled rejection (a runtime error overlay in
+    // dev) even though the preview degrades fine on its own. Report which font
+    // it was instead — a silently unusable face means the preview falls back to
+    // a look-alike while the export still embeds the real one.
+    const loaded = Promise.allSettled(
+      structure.fonts.map((f) => document.fonts.load(`16px "pdffont-${f.xref}"`))
+    ).then((results) => {
+      const failed = results
+        .map((r, i) => (r.status === "rejected" ? structure.fonts[i].xref : null))
+        .filter((xref) => xref !== null)
+      if (failed.length > 0) {
+        console.warn(
+          `Polices d'aperçu refusées par le navigateur (xref ${failed.join(", ")}) : ` +
+            "l'aperçu utilise un repli, l'export reste fidèle."
+        )
+      }
+      return document.fonts.ready
+    })
     Promise.race([
-      Promise.all(families.map((f) => document.fonts.load(f))).then(() =>
-        document.fonts.ready
-      ),
+      loaded,
       new Promise((resolve) => setTimeout(resolve, 6000)),
     ]).finally(() => {
       if (!cancelled) setFontsReady(true)
@@ -1294,7 +1392,7 @@ function PdfPageView({
   // Only a span whose glyphs are being replaced needs its background rebuilt.
   const backdropTargets = page.spans
     .filter((span) => span.id in edits || span.id === editingId)
-    .map((span) => ({ id: span.id, ...effectiveSpan(span) }))
+    .map((span) => ({ id: span.id, span, ...effectiveSpan(span) }))
   // Geometry is part of the key: resizing a box moves the ink band, so the
   // colour has to be sampled again around its new place.
   const backdropKey = backdropTargets
@@ -1322,7 +1420,12 @@ function PdfPageView({
         const color = sampleBackdrop(
           data,
           target.bbox,
-          inkBand(target.bbox, target.origin, target.size),
+          inkBand(
+            target.bbox,
+            target.origin,
+            target.size,
+            inkExtent(target.span.text, target.span, target.size)
+          ),
           pxPerPoint
         )
         if (color) sampled[target.id] = color
@@ -1334,25 +1437,48 @@ function PdfPageView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [renderCount, backdropKey, page.width])
 
+  /**
+   * Style of an edited span's preview, sized the way the export will size it.
+   *
+   * `width` overrides the one `bboxToPercent` derives from the box, so typing
+   * past the original box shows the added characters instead of clipping them
+   * away — the export lets in-place text grow to the page margin too.
+   */
   function spanTextStyle(
+    text: string,
     size: number,
     bbox: BBox,
     origin: [number, number],
     span: PdfSpan
   ): React.CSSProperties {
-    const [top, bottom] = inkBand(bbox, origin, size)
+    const fit = fitPreview(
+      text,
+      span,
+      bbox,
+      origin,
+      size,
+      span.id in spanBoxes,
+      page.width
+    )
+    // Band measured on the *original* text at its original size: it has to
+    // cover the glyphs painted on the canvas, which shrinking the new text to
+    // fit does not make any smaller.
+    const [top, bottom] = inkBand(bbox, origin, size, inkExtent(span.text, span, size))
     const color = backdrops[span.id] ?? spanBackdrop(span.color)
     return {
-      fontSize: size * scale,
+      width: fit.width * scale,
+      fontSize: fit.size * scale,
       lineHeight: `${(bbox[3] - bbox[1]) * scale}px`,
       fontFamily: spanFontFamily(span),
       fontWeight: span.bold ? 700 : 400,
       fontStyle: span.italic ? "italic" : "normal",
       color: span.color,
       // Backdrop restricted to the ink band, so the rest of the box stays
-      // transparent and the neighbouring lines show through untouched.
+      // transparent and the neighbouring lines show through untouched — and to
+      // the original box width, since there are no original glyphs to hide in
+      // the part the preview grew into.
       backgroundImage: `linear-gradient(${color}, ${color})`,
-      backgroundSize: `100% ${(bottom - top) * scale}px`,
+      backgroundSize: `${(bbox[2] - bbox[0]) * scale}px ${(bottom - top) * scale}px`,
       backgroundPosition: `0 ${(top - bbox[1]) * scale}px`,
       backgroundRepeat: "no-repeat",
     }
@@ -1399,10 +1525,12 @@ function PdfPageView({
               <SpanEditor
                 span={span}
                 initialValue={effectiveText}
-                style={{
+                // A function, not a style: the frame and the font size follow
+                // the draft on every keystroke, as the export would.
+                styleFor={(draft) => ({
                   ...bboxToPercent(eff.bbox, page.width, page.height),
-                  ...spanTextStyle(eff.size, eff.bbox, eff.origin, span),
-                }}
+                  ...spanTextStyle(draft, eff.size, eff.bbox, eff.origin, span),
+                })}
                 onCommit={onCommitEdit}
                 onCancel={onCancelEdit}
               />
@@ -1427,18 +1555,25 @@ function PdfPageView({
                 // z-10 keeps text spans above image overlays so text drawn on
                 // top of an image (e.g. a stamp) stays clickable.
                 "absolute z-10 cursor-text rounded-xs text-left whitespace-pre",
-                // Clipped: text longer than its box must not paint over the
-                // neighbouring content (the export shrinks it to fit instead).
-                edited ? "overflow-hidden" : "bg-transparent text-transparent",
+                // Not clipped: the preview is already fitted the way the export
+                // fits it, so it only ever overflows where the export does too
+                // (text shrunk to the size floor), and hiding that would lie.
+                edited ? null : "bg-transparent text-transparent",
+                // No ring while selected: GeometryOverlay draws one on the box
+                // that will actually be sent, and a second ring on the fitted
+                // text frame would read as two competing boxes once the text
+                // has grown past its original width.
                 isSelected
-                  ? "ring-2 ring-primary"
+                  ? null
                   : edited
                     ? "ring-1 ring-primary/40 hover:ring-2 hover:ring-primary/60"
                     : "hover:bg-primary/5 hover:ring-2 hover:ring-primary/40"
               )}
               style={{
                 ...bboxToPercent(eff.bbox, page.width, page.height),
-                ...(edited && scale > 0 ? spanTextStyle(eff.size, eff.bbox, eff.origin, span) : {}),
+                ...(edited && scale > 0
+                  ? spanTextStyle(effectiveText, eff.size, eff.bbox, eff.origin, span)
+                  : {}),
               }}
               onClick={() => {
                 onSelect({ pageIndex: page.number, type: "span", id: span.id })
@@ -1677,13 +1812,13 @@ function CropOverlay({
 function SpanEditor({
   span,
   initialValue,
-  style,
+  styleFor,
   onCommit,
   onCancel,
 }: {
   span: PdfSpan
   initialValue: string
-  style: React.CSSProperties
+  styleFor: (draft: string) => React.CSSProperties
   onCommit: (span: PdfSpan, draft: string) => void
   onCancel: () => void
 }) {
@@ -1701,10 +1836,11 @@ function SpanEditor({
       value={draft}
       aria-label="Modifier le texte"
       // bg-transparent: the backdrop comes from the band-limited background
-      // image in `style`; the input's own field colour would paint a box over
-      // the neighbouring lines.
-      className="absolute z-10 min-w-24 rounded-xs bg-transparent p-0 ring-2 ring-primary outline-none"
-      style={style}
+      // image in the style; the input's own field colour would paint a box over
+      // the neighbouring lines. No ring either — the GeometryOverlay rendered
+      // alongside marks the box, and this frame follows the text instead.
+      className="absolute z-10 min-w-24 rounded-xs bg-transparent p-0 outline-none"
+      style={styleFor(draft)}
       onChange={(event) => setDraft(event.target.value)}
       onBlur={() => onCommit(span, draft)}
       onKeyDown={(event) => {

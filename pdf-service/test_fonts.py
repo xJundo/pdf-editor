@@ -119,6 +119,63 @@ def test_synthesis_refused_when_nothing_maps():
     assert main._with_synthesized_cmap(_strip_tables(LIBERATION, "cmap"), {}) is None
 
 
+def _pack_tables_unaligned(buffer: bytes) -> bytes:
+    """Rewrite an sfnt with its tables butted together, as PDF subsetters do."""
+    num_tables = int.from_bytes(buffer[4:6], "big")
+    entries = []
+    for i in range(num_tables):
+        head = 12 + 16 * i
+        tag = buffer[head : head + 4]
+        checksum = buffer[head + 4 : head + 8]
+        offset = int.from_bytes(buffer[head + 8 : head + 12], "big")
+        length = int.from_bytes(buffer[head + 12 : head + 16], "big")
+        entries.append((tag, checksum, buffer[offset : offset + length]))
+
+    directory = bytearray(buffer[:12])
+    body = bytearray()
+    base = 12 + 16 * num_tables
+    for tag, checksum, data in entries:
+        directory += tag + checksum
+        directory += (base + len(body)).to_bytes(4, "big")
+        directory += len(data).to_bytes(4, "big")
+        body += data  # No padding: that is exactly the defect under test.
+    return bytes(directory + body)
+
+
+@needs_liberation
+def test_misaligned_tables_are_repacked_for_browser_sanitizers():
+    """OTS rejects a font whose table offsets are not 4-byte aligned.
+
+    FreeType does not care, so the export renders such a program fine while the
+    @font-face fails with a bare "Invalid font data in ArrayBuffer" — preview
+    and export drift apart with nothing raised anywhere.
+    """
+    packed = _pack_tables_unaligned(LIBERATION.read_bytes())
+    assert main._sfnt_tables_misaligned(packed)
+
+    repacked = main.sanitized_for_browser(packed)
+    assert not main._sfnt_tables_misaligned(repacked)
+    # Same glyphs, only the padding changed.
+    original = TTFont(LIBERATION, fontNumber=0)
+    assert TTFont(io.BytesIO(repacked), fontNumber=0).getGlyphOrder() == (
+        original.getGlyphOrder()
+    )
+
+
+@needs_liberation
+def test_well_formed_font_is_served_untouched():
+    buffer = LIBERATION.read_bytes()
+    assert not main._sfnt_tables_misaligned(buffer)
+    assert main.sanitized_for_browser(buffer) is buffer
+
+
+def test_unrepackable_buffer_is_returned_as_is():
+    """A rewrite that fails must not cost the caller the bytes it had."""
+    junk = b"\x00\x01\x00\x00" + b"\x00\x01" + b"\x00" * 6 + b"cmap" + b"\x00" * 4 + (30).to_bytes(4, "big") + (9).to_bytes(4, "big") + b"unusable!"
+    assert main._sfnt_tables_misaligned(junk)
+    assert main.sanitized_for_browser(junk) == junk
+
+
 # --- guarding the code==glyph-id assumption ------------------------------
 
 
